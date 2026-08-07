@@ -750,7 +750,11 @@ if [[ "$harness" == "claude" ]]; then
   # depth against a bypass of the normal tuple-parsing path.
   _SGT_CLAUDE_MODEL_RE='^(sonnet|opus|haiku|fable|claude-[a-z][a-z0-9]*-[0-9][A-Za-z0-9._-]*)$'
   if [[ "${#SGT_LAUNCH_MODEL_ARGV[@]}" -ge 2 ]]; then
-    _sgt_model_val="${SGT_LAUNCH_MODEL_ARGV[-1]}"
+    # Bash 3.2 has no negative array subscript ([-1]); compute the last index
+    # explicitly, matching the version floor _sgt-bash-version.sh enforces.
+    _sgt_last_idx=$(( ${#SGT_LAUNCH_MODEL_ARGV[@]} - 1 ))
+    _sgt_model_val="${SGT_LAUNCH_MODEL_ARGV[$_sgt_last_idx]}"
+    unset _sgt_last_idx
     if [[ ! "$_sgt_model_val" =~ $_SGT_CLAUDE_MODEL_RE ]]; then
       printf 'failed: claude model pin rejected by pre-flight check: %s\n' \
         "$_sgt_model_val" > "$REPO_STATE/diagnostic"
