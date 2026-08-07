@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
-# Regression for _sgt_claude_stop_bg_session (bin/_sgt-drain.sh), the shared
-# backstop every one of the Claude Background Harness PRD's eight independent
-# termination paths calls.  Two things matter here: the helper itself is
-# correct (idempotent, resolves the binary through fleet state's own `agent`
-# field rather than a hardcoded literal `claude`, never fails), and every one
-# of the eight call sites named in the PRD's Recovery Semantics section still
-# actually calls it — a structural check, since standing up full tmux-based
-# integration for sgt-cleanup/sgt-watch/sgt-recover/sgt-respond/sgt-dispatch/
-# sgt-validate/sgt-drain-force/sgt-interactive-worker's _drain_terminate for
-# this one narrow property each is prohibitively expensive relative to what it
-# would additionally prove; this still catches the actual regression risk —
-# someone deleting or forgetting the backstop call at a site.
+# Regression for the shared Claude session helpers in bin/_sgt-drain.sh:
+# _sgt_claude_stop_bg_session (the backstop every one of the Claude Background
+# Harness PRD's eight independent termination paths calls) and
+# _sgt_claude_bg_session_is_live (the liveness check sgt-recover's stall-
+# recovery relaunch and sgt-respond's superseded-worker relaunch both use
+# before dispatching a replacement worker, PRD CH-8).  Three things matter
+# here: each helper is correct on its own (idempotent, resolves the binary
+# through fleet state's own `agent` field rather than a hardcoded literal
+# `claude`, never fails, and — for the liveness check — true only for a
+# genuinely working/blocked session); and every one of the eight termination
+# call sites named in the PRD's Recovery Semantics section still actually
+# calls the stop backstop — a structural check, since standing up full
+# tmux-based integration for sgt-cleanup/sgt-watch/sgt-recover/sgt-respond/
+# sgt-dispatch/sgt-validate/sgt-drain-force/sgt-interactive-worker's
+# _drain_terminate for this one narrow property each is prohibitively
+# expensive relative to what it would additionally prove; this still catches
+# the actual regression risk — someone deleting or forgetting the backstop
+# call at a site.  Full tmux/response-lock integration of sgt-recover's and
+# sgt-respond's own relaunch flows (proving the stop-then-dispatch ORDERING,
+# not just the underlying state decision) is not covered here either, for the
+# same cost-vs-value reason.
 
 set -euo pipefail
 
@@ -114,6 +123,65 @@ after_lines="$(wc -l < "$TEST_ROOT/stop-calls.log" | tr -d ' ')"
   printf 'FAIL: a background id containing shell metacharacters reached the stop call\n' >&2
   exit 1
 }
+
+# ── 5b. _sgt_claude_bg_session_is_live: true only for working/blocked ────────
+# The core state-determination logic sgt-recover's stall-recovery relaunch and
+# sgt-respond's superseded-worker relaunch both depend on before dispatching a
+# replacement worker (PRD CH-8 / Recovery Semantics).  Full tmux-based
+# integration of the relaunch flows themselves is out of scope for this file
+# (same cost-vs-value tradeoff as the structural check below); this proves the
+# helper's own decision is correct for every state value that matters.
+
+command -v jq >/dev/null 2>&1 || {
+  printf 'sgt-claude-stop-bg-session: skipped remaining cases (jq unavailable)\n'
+  exit 0
+}
+
+_fake_claude_reporting_state() {
+  local dir="$1" state="$2"
+  mkdir -p "$dir"
+  cat > "$dir/claude" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "agents" ]]; then
+  echo '[{"id":"live-check-bg","state":"$state","sessionId":"live-check-session"}]'
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "$dir/claude"
+}
+
+for state in working blocked; do
+  repo_dir="$TEST_ROOT/live-$state"
+  mkdir -p "$repo_dir"
+  _fake_claude_reporting_state "$TEST_ROOT/fake-bin-$state" "$state"
+  printf 'live-check-bg\n' > "$repo_dir/claude_background_id"
+  printf '%s\n' "$TEST_ROOT/fake-bin-$state/claude" > "$repo_dir/agent"
+  _sgt_claude_bg_session_is_live "$repo_dir" || {
+    printf 'FAIL: a session reporting state=%s was not treated as live\n' "$state" >&2
+    exit 1
+  }
+done
+
+for state in stopped failed totally-unrecognized-value; do
+  repo_dir="$TEST_ROOT/notlive-$state"
+  mkdir -p "$repo_dir"
+  _fake_claude_reporting_state "$TEST_ROOT/fake-bin-notlive-$state" "$state"
+  printf 'live-check-bg\n' > "$repo_dir/claude_background_id"
+  printf '%s\n' "$TEST_ROOT/fake-bin-notlive-$state/claude" > "$repo_dir/agent"
+  if _sgt_claude_bg_session_is_live "$repo_dir"; then
+    printf 'FAIL: a session reporting state=%s was incorrectly treated as live\n' "$state" >&2
+    exit 1
+  fi
+done
+
+# No recorded background id at all: never live, never calls out to any binary.
+repo_dir="$TEST_ROOT/notlive-no-id"
+mkdir -p "$repo_dir"
+if _sgt_claude_bg_session_is_live "$repo_dir"; then
+  printf 'FAIL: a repo with no recorded background id was treated as live\n' >&2
+  exit 1
+fi
 
 # ── 6. Structural check: every one of the eight termination paths still ─────
 #      calls the shared backstop.  Each entry is <file>:<function-or-context>

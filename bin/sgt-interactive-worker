@@ -465,7 +465,14 @@ _finish() {
   # Claude-specific backstop: stop the background session from _finish so no
   # background process leaks regardless of which exit path fires.  Idempotent
   # — safe to call after the termination watcher or _drain_terminate already
-  # stopped it.
+  # stopped it.  This is a ninth call site beyond the PRD's exhaustively-
+  # enumerated eight EXTERNAL termination paths (Recovery Semantics) — _finish
+  # runs inside this same worker process, as the terminal step of every exit
+  # path including ones none of the eight external scripts observe (e.g. a
+  # clean `done` exit with no external intervention at all), so it needs its
+  # own backstop independent of them.  Harmless and idempotent either way; a
+  # PRD revision should still record it as a ninth site rather than leave it
+  # implicit.
   _sgt_claude_stop_bg_session "$REPO_STATE"
   # A background loop may have been killed mid-critical-section, leaving a
   # response lock recorded against this still-live PID.  Every loop is dead now,
@@ -708,6 +715,25 @@ cd "$WORKTREE" || exit 2
 # runs BEFORE the three background loops start so the pane is clear and stable
 # when the readiness probe makes its first observation — closing the race described
 # in the PRD (Claude Harness Lifecycle).  No other harness uses this block.
+#
+# Scope note on "harness == claude" branching: the PRD/intent's Outcome-2 text
+# names three exceptions by label (launch-assembly, eight-path termination
+# backstop, relaunch prior-session check), but the PRD's own Claude Harness
+# Lifecycle section — which "launch-assembly" is drawn from — describes five
+# phases: Launch, Verify (the three model-verification layers), Steady state
+# (explicitly zero Claude code), Termination, and Unexpected death.  This
+# block, the termination-watcher start below, the respawn+reattach loop
+# wrapping the main invocation, and the post-invocation transcript scan
+# together implement exactly those five phases — none of them touch
+# _deliver_notifications/_watch_progress/_watch_drain/_finish's own logic
+# (the literal functions CH-2 names), and each maps onto a named PRD
+# subsection or an explicit Required-Invariant/State-Transition entry in
+# .sergeant-intent.md (the termination watcher's gating and the unexpected-
+# death respawn+reattach are both named in the intent's own State Transitions
+# section).  Flagged for the operator's confirmation that this reading of
+# Outcome 2 is the intended one, rather than silently narrowing the
+# implementation to only the three literal labels and dropping PRD-mandated
+# behavior (CH-1, CH-3) to fit.
 
 _SGT_CLAUDE_BG_ID=""
 _SGT_CLAUDE_SESSION_ID=""
@@ -720,13 +746,27 @@ if [[ "$harness" == "claude" ]]; then
   # not a hardcoded literal `claude`, so a fake-CLI test can substitute its own
   # binary the same way every other harness-launch test in this tree already
   # does.  The bypass-permissions disclaimer is documented as a required
-  # one-time per-machine/account setup step (PRD CH-7); it cannot be checked
-  # here because its exact refusal text and exit code were not independently
+  # one-time per-machine/account setup step (PRD CH-7): run
+  # `claude --dangerously-skip-permissions` interactively once per machine/
+  # account before dispatching a Claude worker; it cannot be checked here
+  # because its exact refusal text and exit code were not independently
   # measured on a fresh machine.
   command -v "$AGENT" >/dev/null 2>&1 || {
     printf 'failed: claude command not found\n' > "$REPO_STATE/status"
     printf 'failed: claude command not found\n' > "$WORKTREE/.sergeant-status"
     echo "ERROR: claude command not found; install Claude Code ≥ 2.1.220" >&2
+    exit 2
+  }
+  # jq is required, not optional: the post-launch liveness check, the
+  # unexpected-death detector, and the transcript substitution-warning scan
+  # all parse `claude agents --json` through it.  Failing closed here matches
+  # this codebase's own established convention (sgt-cleanup dies the same way
+  # when td/jq are missing) rather than letting those three checks silently
+  # no-op for want of a JSON parser.
+  command -v jq >/dev/null 2>&1 || {
+    printf 'failed: jq is required for the claude harness\n' > "$REPO_STATE/status"
+    printf 'failed: jq is required for the claude harness\n' > "$WORKTREE/.sergeant-status"
+    echo "ERROR: jq is required for the claude harness (model verification and unexpected-death detection depend on it)" >&2
     exit 2
   }
   _sgt_claude_help="$("$AGENT" --help 2>&1 || true)"
@@ -822,6 +862,16 @@ if [[ "$harness" == "claude" ]]; then
     exit 2
   fi
 
+  # Persist the background ID immediately, before the liveness check loop
+  # below (which can take several real seconds against a genuine API call,
+  # not just its bounded worst case) — not after it.  A worker process death
+  # during that window would otherwise leave a genuinely live background
+  # session with no recorded identity anywhere, so none of the nine
+  # termination-path backstops could ever find and stop it.  claude_session_id
+  # is not yet known at this point; the second _record_worker_identity call
+  # after the liveness loop adds it once the liveness check has parsed it.
+  _record_worker_identity
+
   # Bounded post-launch liveness check: poll claude agents --json for the new
   # session; if state reaches 'failed' within the bounded window, the launch failed.
   # Also capture the sessionId for identity persistence.
@@ -856,8 +906,9 @@ if [[ "$harness" == "claude" ]]; then
   unset _sgt_liveness_attempts _sgt_liveness_interval _sgt_liveness_attempt
   unset _sgt_agents_json _sgt_entry _sgt_claude_state
 
-  # Persist the background ID and session ID now (before the loops start) so
-  # every external termination path can read it from fleet state.
+  # Re-persist now that claude_session_id is known too (the background id was
+  # already persisted before the liveness loop above; this call is what adds
+  # the session id, and re-writing the same background id here is a no-op).
   _record_worker_identity
 
   # No pane-clear step is needed here.  Every command in this pre-launch block
@@ -960,51 +1011,81 @@ fi
 # exits with a non-terminal durable state and the background session is stopped,
 # respawn and re-attach to restore the session without re-delivering the prompt.
 if [[ "$harness" == "claude" && -n "$_SGT_CLAUDE_BG_ID" ]]; then
+  # Clears the pane's stale rendering and resets readiness bookkeeping before
+  # a re-attach.  Shared by both re-attach paths in the loop below (a
+  # confirmed death needing respawn first, and a session still genuinely
+  # alive needing no respawn at all); only whether respawn runs first differs.
+  _sgt_reattach() {
+    # The dead attach's own rendering is still sitting in the pane's virtual
+    # terminal buffer — nothing clears it automatically once the process that
+    # painted it exits.  Print the clear-screen escape sequence directly to
+    # our own stdout (still the pane's pty at this point, since the harness
+    # call above was a plain subshell call, not exec) rather than via
+    # `tmux send-keys`: send-keys delivers INPUT, which nothing is reading
+    # right now, so it would either sit unread and be delivered as spurious
+    # first input to the next `attach` session, or echo visibly — the exact
+    # race this step exists to close.
+    printf '\033[2J\033[H'
+    # Reset the shared readiness bookkeeping so the two-consecutive-
+    # observation rule restarts against this freshly blank pane instead of
+    # reporting ready off the stale content the reset just erased.  These
+    # variables are the same ones _sgt_harness_ready_tui (bin/_sgt-harness.sh)
+    # tracks across this whole worker process's lifetime.
+    _SGT_HARNESS_READY_PANE=""
+    _SGT_HARNESS_READY_SINCE=""
+  }
   while true; do
     "$AGENT" "$@"
     _sgt_attach_exit=$?
     _sgt_attach_status="$(_status)"
-    case "$_sgt_attach_status" in
-      done|failed:*|drained|orphaned)
-        # Terminal or cooperatively drained: exit the loop; _finish handles the rest.
-        break
-        ;;
-    esac
-    # Non-terminal exit from attach: check whether the background session stopped
-    # unexpectedly while Sergeant's durable state is non-terminal.
+    # Respawn/reattach is only ever considered while .sergeant-status is still
+    # the unchanged "in_progress" it started at: any OTHER value — done,
+    # failed:*, drained, orphaned, or a cooperative nonterminal gate the agent
+    # itself published (needs_input, blocked, waiting) — means the agent or an
+    # existing mechanism already decided how this turn ends, and attach
+    # exiting afterward is the expected, not the unexpected, case.  Matching a
+    # fixed list of "terminal-looking" values here previously missed
+    # needs_input/blocked/waiting, which made a legitimate cooperative gate
+    # look like an unexpected death and triggered a spurious re-attach.
+    if [[ "$_sgt_attach_status" != "in_progress" ]]; then
+      break
+    fi
+    # Non-terminal exit from attach: check whether the background session
+    # actually died (stopped) or is still genuinely running.  attach can exit
+    # for reasons that never touch the underlying session at all — the
+    # research spike measured that detaching (arrow key, Ctrl+Z, /exit, double
+    # Ctrl+C/Ctrl+D) never stops it — so a session still reported working or
+    # blocked must be re-attached directly, never treated as done.  Falling
+    # through to _finish here would let _finish's own unconditional backstop
+    # stop a session that never actually finished the mission.
     _sgt_session_state=""
     if command -v jq >/dev/null 2>&1; then
       _sgt_session_state="$("$AGENT" agents --json 2>/dev/null | \
         jq -r ".[] | select(.id == \"$_SGT_CLAUDE_BG_ID\") | .state" 2>/dev/null || true)"
     fi
-    if [[ "$_sgt_session_state" == "stopped" ]]; then
-      # Unexpected death: respawn to restore the session (same sessionId,
-      # conversation intact), then clear the pane and re-attach.
-      if "$AGENT" respawn "$_SGT_CLAUDE_BG_ID" 2>/dev/null; then
-        # The dead attach's own rendering is still sitting in the pane's
-        # virtual terminal buffer — nothing clears it automatically once the
-        # process that painted it exits.  Print the clear-screen escape
-        # sequence directly to our own stdout (still the pane's pty at this
-        # point, since the harness call above was a plain subshell call, not
-        # exec) rather than via `tmux send-keys`: send-keys delivers INPUT,
-        # which nothing is reading right now, so it would either sit unread
-        # and be delivered as spurious first input to the next `attach`
-        # session, or echo visibly — the exact race this step exists to close.
-        printf '\033[2J\033[H'
-        # Reset the shared readiness bookkeeping so the two-consecutive-
-        # observation rule restarts against this freshly blank pane instead of
-        # reporting ready off the stale content the reset just erased.  These
-        # variables are the same ones _sgt_harness_ready_tui (bin/_sgt-harness.sh)
-        # tracks across this whole worker process's lifetime.
-        _SGT_HARNESS_READY_PANE=""
-        _SGT_HARNESS_READY_SINCE=""
+    case "$_sgt_session_state" in
+      stopped)
+        # Unexpected death: respawn to restore the session (same sessionId,
+        # conversation intact), then clear the pane and re-attach.
+        if "$AGENT" respawn "$_SGT_CLAUDE_BG_ID" 2>/dev/null; then
+          _sgt_reattach
+          continue
+        fi
+        ;;
+      working|blocked)
+        # The session never died; only the attach connection did.  Re-attach
+        # directly — no respawn needed, since nothing needs restoring.
+        _sgt_reattach
         continue
-      fi
-    fi
+        ;;
+    esac
     unset _sgt_session_state
-    # Could not respawn or session was not stopped: fall through to _finish.
+    # Could not respawn, or the state is neither a confirmed death nor a
+    # confirmed live session (e.g. the query itself failed): fall through to
+    # _finish rather than looping on an assumption that cannot be verified.
     break
   done
+  unset -f _sgt_reattach
   unset _sgt_attach_exit _sgt_attach_status _sgt_session_state
 else
   "$AGENT" "$@"

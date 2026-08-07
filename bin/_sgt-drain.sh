@@ -700,11 +700,31 @@ _sgt_claude_bg_id_and_bin() {
 # is not a child of the worker's process group and is invisible to
 # process-tree or tmux kill-pane signals; every termination path that kills a
 # pane or process must also call this function to prevent silent session leaks.
+#
+# Session-id cross-check (PRD Privacy and Security Constraints: "every
+# destructive operation ... verifies the recorded id and sessionId against the
+# live session before acting"): when both a recorded claude_session_id and a
+# live sessionId for this exact background id are available, a mismatch skips
+# the stop — the recorded id has been reused by an unrelated session, and
+# stopping it would affect the wrong one.  This check is deliberately
+# best-effort, not fail-closed: an unresolvable session_id (not yet persisted,
+# jq unavailable, or the query itself failing) still calls stop, because the
+# backstop's primary job — preventing a genuinely leaked live session from
+# running forever — must not be defeated by an unrelated, transient
+# verification failure.  Only a confirmed, positive mismatch skips the call.
 _sgt_claude_stop_bg_session() {
-  local repo_dir="$1" bg_id claude_bin resolved
+  local repo_dir="$1" bg_id claude_bin resolved recorded_session_id live_session_id
   resolved="$(_sgt_claude_bg_id_and_bin "$repo_dir")" || return 0
   bg_id="${resolved%% *}"
   claude_bin="${resolved#* }"
+  recorded_session_id="$(cat "$repo_dir/claude_session_id" 2>/dev/null | tr -d '\n' || true)"
+  if [[ -n "$recorded_session_id" ]] && command -v jq >/dev/null 2>&1; then
+    live_session_id="$("$claude_bin" agents --json 2>/dev/null | \
+      jq -r ".[] | select(.id == \"$bg_id\") | .sessionId" 2>/dev/null || true)"
+    if [[ -n "$live_session_id" && "$live_session_id" != "$recorded_session_id" ]]; then
+      return 0
+    fi
+  fi
   "$claude_bin" stop "$bg_id" 2>/dev/null || true
 }
 

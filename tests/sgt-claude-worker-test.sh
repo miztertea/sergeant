@@ -503,10 +503,16 @@ grep -qF 'subst-bg-1' "$TEST_ROOT/substituted/state/model_substitution_warning" 
 }
 
 # ── 13. A message queued mid-turn is delivered after the current turn ────────
-# Uses the existing unmodified notification loop once attached — this only
-# proves nothing Claude-specific interferes with that delivery once the
-# worker's persistent slot is `attach`.  Covered end-to-end by
-# tests/sgt-worker-handshake-test.sh for every registry harness including
-# claude; this file does not duplicate that coverage.
+# NOT independently covered here or by tests/sgt-worker-handshake-test.sh: that
+# file's fake harness body performs a sequential ack/accept/complete handshake
+# with no simulated "busy/generating" state, so it does not actually model a
+# message arriving while a turn is in progress.  What IS covered — by every
+# other case in this file plus the handshake test's own claude fake — is that
+# nothing Claude-specific was added to the notification loop itself, which is
+# what makes reusing that loop unmodified a reasonable bet for this specific
+# scenario too.  The scenario itself was only measured manually against a real
+# claude session (docs/research/claude-background-harness-spike.md's "A
+# message sent via tmux send-keys to an attached session..." finding); it is
+# not exercised by an automated fake-CLI regression.
 
 printf 'sgt-claude-worker: ok\n'
