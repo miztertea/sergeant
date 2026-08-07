@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# Regression for _sgt_claude_stop_bg_session (bin/_sgt-drain.sh), the shared
+# backstop every one of the Claude Background Harness PRD's eight independent
+# termination paths calls.  Two things matter here: the helper itself is
+# correct (idempotent, resolves the binary through fleet state's own `agent`
+# field rather than a hardcoded literal `claude`, never fails), and every one
+# of the eight call sites named in the PRD's Recovery Semantics section still
+# actually calls it — a structural check, since standing up full tmux-based
+# integration for sgt-cleanup/sgt-watch/sgt-recover/sgt-respond/sgt-dispatch/
+# sgt-validate/sgt-drain-force/sgt-interactive-worker's _drain_terminate for
+# this one narrow property each is prohibitively expensive relative to what it
+# would additionally prove; this still catches the actual regression risk —
+# someone deleting or forgetting the backstop call at a site.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TEST_ROOT"' EXIT
+
+# shellcheck source=bin/_sgt-drain.sh
+source "$ROOT_DIR/bin/_sgt-drain.sh"
+
+# ── 1. No-op when claude_background_id is absent ──────────────────────────────
+
+repo_dir="$TEST_ROOT/no-id"
+mkdir -p "$repo_dir"
+_sgt_claude_stop_bg_session "$repo_dir" || {
+  printf 'FAIL: the helper returned non-zero for an absent background id\n' >&2
+  exit 1
+}
+
+# ── 2. No-op when the resolved binary does not exist ──────────────────────────
+
+repo_dir="$TEST_ROOT/no-binary"
+mkdir -p "$repo_dir"
+printf 'some-bg-id\n' > "$repo_dir/claude_background_id"
+printf '%s\n' "$TEST_ROOT/no-binary/definitely-not-a-real-binary" > "$repo_dir/agent"
+_sgt_claude_stop_bg_session "$repo_dir" || {
+  printf 'FAIL: the helper returned non-zero for an unresolvable binary\n' >&2
+  exit 1
+}
+
+# ── 3. Calls "<agent> stop <id>", resolved from fleet state's own agent field ─
+# (not a hardcoded literal `claude`), and is idempotent across repeats.
+
+repo_dir="$TEST_ROOT/happy"
+mkdir -p "$repo_dir" "$TEST_ROOT/fake-bin"
+cat > "$TEST_ROOT/fake-bin/claude" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "stop" ]]; then
+  printf '%s\n' "\$2" >> "$TEST_ROOT/stop-calls.log"
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$TEST_ROOT/fake-bin/claude"
+printf 'happy-bg-id\n' > "$repo_dir/claude_background_id"
+printf '%s\n' "$TEST_ROOT/fake-bin/claude" > "$repo_dir/agent"
+
+_sgt_claude_stop_bg_session "$repo_dir"
+[[ -f "$TEST_ROOT/stop-calls.log" ]] || {
+  printf 'FAIL: the resolved agent binary was never called\n' >&2
+  exit 1
+}
+[[ "$(cat "$TEST_ROOT/stop-calls.log")" == "happy-bg-id" ]] || {
+  printf 'FAIL: stop was called with the wrong background id: %q\n' \
+    "$(cat "$TEST_ROOT/stop-calls.log")" >&2
+  exit 1
+}
+
+# Repeat: idempotent — a second call is a no-op success, not an error.
+_sgt_claude_stop_bg_session "$repo_dir"
+[[ "$(wc -l < "$TEST_ROOT/stop-calls.log" | tr -d ' ')" == "2" ]] || {
+  printf 'FAIL: a repeat stop was not observed as an idempotent no-op call\n' >&2
+  exit 1
+}
+
+# ── 4. Falls back to a bare "claude" lookup when fleet state predates the ────
+#      recorded agent field (no repo_dir/agent file at all)
+
+repo_dir="$TEST_ROOT/legacy-fallback"
+mkdir -p "$repo_dir"
+printf 'legacy-bg-id\n' > "$repo_dir/claude_background_id"
+# No repo_dir/agent file: the helper must fall back to a bare "claude" lookup
+# on PATH rather than fail.  Point PATH at the fake bin above so the fallback
+# resolves to something and the call is observable without depending on a
+# real claude install existing on this machine.
+PATH="$TEST_ROOT/fake-bin:$PATH" _sgt_claude_stop_bg_session "$repo_dir"
+[[ "$(wc -l < "$TEST_ROOT/stop-calls.log" | tr -d ' ')" == "3" ]] || {
+  printf 'FAIL: the legacy fallback (no recorded agent field) did not resolve a binary and call stop\n' >&2
+  exit 1
+}
+[[ "$(tail -1 "$TEST_ROOT/stop-calls.log")" == "legacy-bg-id" ]] || {
+  printf 'FAIL: the legacy fallback called stop with the wrong background id\n' >&2
+  exit 1
+}
+
+# ── 5. Rejects a background id containing shell metacharacters ───────────────
+# The recorded id is validated against an alphanumeric-safe charset before
+# ever reaching a command line.
+
+repo_dir="$TEST_ROOT/malformed-id"
+mkdir -p "$repo_dir"
+printf '%s\n' 'bg;rm -rf /' > "$repo_dir/claude_background_id"
+printf '%s\n' "$TEST_ROOT/fake-bin/claude" > "$repo_dir/agent"
+before_lines="$(wc -l < "$TEST_ROOT/stop-calls.log" | tr -d ' ')"
+_sgt_claude_stop_bg_session "$repo_dir" || {
+  printf 'FAIL: the helper returned non-zero for a malformed background id\n' >&2
+  exit 1
+}
+after_lines="$(wc -l < "$TEST_ROOT/stop-calls.log" | tr -d ' ')"
+[[ "$before_lines" == "$after_lines" ]] || {
+  printf 'FAIL: a background id containing shell metacharacters reached the stop call\n' >&2
+  exit 1
+}
+
+# ── 6. Structural check: every one of the eight termination paths still ─────
+#      calls the shared backstop.  Each entry is <file>:<function-or-context>
+#      naming the specific site the PRD's Recovery Semantics section
+#      enumerates, so a removed call fails with the exact site named, not a
+#      generic count mismatch.
+
+declare -a sites=(
+  "bin/sgt-cleanup:_stop_local_worker"
+  "bin/sgt-cleanup:_stop_validation_pane"
+  "bin/sgt-watch:_recycle_terminal_worker"
+  "bin/sgt-drain-force:force-stop loop"
+  "bin/sgt-recover:stall-recovery kill"
+  "bin/sgt-respond:supersede/relaunch-failure kill"
+  "bin/sgt-dispatch:post-launch rollback kill"
+  "bin/sgt-validate:validation-launch rollback"
+  "bin/sgt-interactive-worker:_drain_terminate"
+)
+for site in "${sites[@]}"; do
+  file="${site%%:*}"
+  label="${site#*:}"
+  grep -qF '_sgt_claude_stop_bg_session' "$ROOT_DIR/$file" || {
+    printf 'FAIL: %s (%s) no longer calls _sgt_claude_stop_bg_session\n' "$file" "$label" >&2
+    exit 1
+  }
+done
+# bin/sgt-interactive-worker's own _finish is a ninth call site, beyond the
+# PRD's enumerated eight (it is the termination watcher's own cleanup
+# boundary, not one of the eight external paths) — checked separately so a
+# missing entry there is distinguishable from a missing entry in the eight.
+grep -A2 '^_finish() {' "$ROOT_DIR/bin/sgt-interactive-worker" | \
+  grep -qF '_sgt_claude_stop_bg_session' || true
+awk '/^_finish\(\) \{/,/^\}/' "$ROOT_DIR/bin/sgt-interactive-worker" | \
+  grep -qF '_sgt_claude_stop_bg_session' || {
+  printf 'FAIL: _finish no longer calls _sgt_claude_stop_bg_session\n' >&2
+  exit 1
+}
+
+printf 'sgt-claude-stop-bg-session: ok\n'

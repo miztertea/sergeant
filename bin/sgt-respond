@@ -466,6 +466,24 @@ _record_relaunch_orphan() {
   "$SCRIPT_DIR/sgt-td-memory" handoff "$REPO_DIR" "$worktree" || true
 }
 
+# Prior-session liveness check: if the superseded worker left a live Claude
+# background session (working or blocked), stop it before dispatching the
+# replacement so no two Claude processes run concurrently against the same
+# worktree.  Required ordering: stop-then-dispatch.
+_sgt_respond_prior_bg_id="$(tr -d '\n' < "$REPO_DIR/claude_background_id" 2>/dev/null || true)"
+if [[ -n "$_sgt_respond_prior_bg_id" ]] && command -v claude >/dev/null 2>&1 && \
+   command -v jq >/dev/null 2>&1; then
+  _sgt_respond_prior_state="$(claude agents --json 2>/dev/null | \
+    jq -r ".[] | select(.id == \"$_sgt_respond_prior_bg_id\") | .state" 2>/dev/null || true)"
+  if [[ "$_sgt_respond_prior_state" == "working" || \
+        "$_sgt_respond_prior_state" == "blocked" ]]; then
+    claude stop "$_sgt_respond_prior_bg_id" 2>/dev/null || true
+    printf 'respond-relaunch preempted live prior claude background session: %s\n' \
+      "$_sgt_respond_prior_bg_id" >> "$REPO_DIR/diagnostic" 2>/dev/null || true
+  fi
+fi
+unset _sgt_respond_prior_bg_id _sgt_respond_prior_state
+
 if ! new_pane="$(tmux new-window -P -F '#{pane_id}' -t "$tmux_session:" -n "$window_name" \
   -c "$worktree" "$worker_command")"; then
   # Release drain admission lock before reporting failure.
@@ -485,11 +503,17 @@ if pane_identity="$(_sgt_pane_identity "$new_pane")" && [[ -n "$pane_identity" ]
     _die "Could not publish worker pane identity"
   if ! _sgt_notification_target_create "$REPO_DIR" "$delivery_notification_id" \
       "$pane_identity" >/dev/null; then
+    # Claude-specific backstop: stop any background session the new worker may
+    # have started before the notification target race was detected.
+    _sgt_claude_stop_bg_session "$REPO_DIR"
     tmux kill-pane -t "$new_pane" 2>/dev/null || true
     _record_relaunch_orphan "notification target race detected during relaunch"
     _die "notification target race detected for $TASK_ID/$REPO; relaunched worker orphaned"
   fi
 else
+  # Claude-specific backstop: stop any background session the new worker may
+  # have started before the pane identity capture failed.
+  _sgt_claude_stop_bg_session "$REPO_DIR"
   tmux kill-pane -t "$new_pane" 2>/dev/null || true
   _record_relaunch_orphan "tmux failed to capture exact relaunched worker pane identity"
   _die "Worker relaunch identity capture failed for $TASK_ID/$REPO"
@@ -499,10 +523,16 @@ fi
 # sgt-recover uses.  A failure before this point leaves the original supervisor
 # untouched.
 if [[ -n "$superseded_live_pane" && "$superseded_live_pane" != "$new_pane" ]]; then
+  # Claude backstop for the superseded pane: the prior-session check above
+  # already stopped any live session; this call is idempotent.
+  _sgt_claude_stop_bg_session "$REPO_DIR"
   tmux kill-pane -t "$superseded_live_pane" 2>/dev/null || true
 fi
 _sgt_response_lock_release
 if ! _sgt_wait_worker_notification "$new_pane" "$REPO_DIR" "$delivery_notification_id"; then
+  # Claude-specific backstop: stop any background session the relaunched worker
+  # may have started before timing out.
+  _sgt_claude_stop_bg_session "$REPO_DIR"
   tmux kill-pane -t "$new_pane" 2>/dev/null || true
   _record_relaunch_orphan "relaunched interactive worker did not acknowledge its durable response notification"
   _die "Worker relaunch notification acknowledgement timed out for $TASK_ID/$REPO"

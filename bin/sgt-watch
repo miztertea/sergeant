@@ -329,6 +329,11 @@ _recycle_terminal_worker() {
     _sgt_finalize_action_lease "$repo_dir" "$worktree_path" "terminal_recycle" || true
   fi
 
+  # Claude-specific backstop: stop the background session before recycling the
+  # pane.  A background Claude session is not a child of the pane's process
+  # group and is invisible to tmux kill-pane.  Idempotent.
+  _sgt_claude_stop_bg_session "$repo_dir"
+
   pane="$(cat "$repo_dir/pane" 2>/dev/null || true)"
   [[ -n "$pane" ]] || return 0
   identity="$(_sgt_read_owned_file "$repo_dir/pane_identity" 2>/dev/null || \

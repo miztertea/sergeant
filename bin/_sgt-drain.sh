@@ -658,3 +658,35 @@ _sgt_drain_remove_project() {
   drain_file="$(_sgt_drain_project_file "$project")"
   _sgt_drain_run_locked rm -f "$drain_file"
 }
+
+# _sgt_claude_stop_bg_session <repo_dir>
+#
+# Read the persisted claude_background_id from fleet state and call
+# `<agent> stop <id>`, idempotently.  The binary is resolved from fleet
+# state's own recorded `agent` field (the same field _sgt_worker_command
+# already uses to relaunch a worker), falling back to a bare `claude` lookup
+# on PATH for fleet state that predates this field.  Resolving through the
+# recorded agent path — rather than a hardcoded literal `claude` — keeps this
+# helper testable through the same single-seam fake-binary pattern every other
+# harness-launch test in this tree already uses.
+#
+# Never fails: a missing id, an unresolvable binary, or a repeated stop on an
+# already-stopped session are all silent no-ops.  A background Claude session
+# is not a child of the worker's process group and is invisible to
+# process-tree or tmux kill-pane signals; every termination path that kills a
+# pane or process must also call this function to prevent silent session leaks.
+_sgt_claude_stop_bg_session() {
+  local repo_dir="$1" bg_id claude_bin
+  [[ -d "$repo_dir" ]] || return 0
+  # `cat` is used deliberately, not `<` input redirection: an input
+  # redirection from a missing path fails before `tr`/`2>/dev/null` ever
+  # takes effect, so the shell would report its own "No such file or
+  # directory" for every legitimately absent field (same caveat as
+  # sgt-cleanup's _response_state_field).
+  bg_id="$(cat "$repo_dir/claude_background_id" 2>/dev/null | tr -d '\n' || true)"
+  [[ -n "$bg_id" && "$bg_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 0
+  claude_bin="$(cat "$repo_dir/agent" 2>/dev/null | tr -d '\n' || true)"
+  [[ -n "$claude_bin" ]] || claude_bin="claude"
+  command -v "$claude_bin" >/dev/null 2>&1 || return 0
+  "$claude_bin" stop "$bg_id" 2>/dev/null || true
+}

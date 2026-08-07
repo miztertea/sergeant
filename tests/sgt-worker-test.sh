@@ -133,7 +133,32 @@ fi
 EOF
 chmod +x "$TEST_ROOT/fake-bin/opencode"
 ln -s opencode "$TEST_ROOT/fake-bin/goose"
-ln -s opencode "$TEST_ROOT/fake-bin/claude"
+
+# Claude's launch mechanics differ fundamentally from OpenCode/Goose (Claude
+# Background Harness PRD): sgt-interactive-worker's Claude branch launches a
+# background session (--bg), inspects it (agents --json), then holds the
+# worker's persistent foreground slot on `attach <id>` instead of a bare
+# invocation.  A bare symlink to the opencode fake — which the shared harness
+# behavior below still tests — no longer represents that.  This fake instead
+# handles the claude-specific subcommands directly and delegates `attach` to
+# the same opencode fake body every other harness in this file already uses,
+# after shifting away the `attach <id>` prefix so downstream ARG_LOG
+# assertions still see the same argv shape those tests were written against.
+cat > "$TEST_ROOT/fake-bin/claude" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  --help) echo "--bg attach stop agents respawn"; exit 0 ;;
+  --bg) echo "fake-claude-bg-1"; exit 0 ;;
+  agents) echo '[{"id":"fake-claude-bg-1","state":"working","sessionId":"fake-claude-session-1"}]'; exit 0 ;;
+  stop|respawn) exit 0 ;;
+  attach)
+    shift 2
+    exec "$(dirname "$0")/opencode" "$@"
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$TEST_ROOT/fake-bin/claude"
 cat > "$TEST_ROOT/fake-bin/ln" <<'EOF'
 #!/usr/bin/env bash
 if [[ -n "${FAIL_LOCK_FILE:-}" && -e "$FAIL_LOCK_FILE" && "$*" == *response.lock* ]]; then

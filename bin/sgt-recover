@@ -304,6 +304,24 @@ _sgt_publish_worker_notification "$REPO_DIR" "$worktree" \
   "Resume the mission after stall recovery. Read the current worktree and td state, check the latest td handoff, and continue from where you left off."
 
 # ── 12. Launch new worker pane ───────────────────────────────────────────────
+# Prior-session liveness check: if the stalled worker left a live Claude
+# background session (working or blocked), stop it now — before the replacement
+# worker starts — so no two Claude processes ever run concurrently against the
+# same worktree.  The check runs before tmux new-window so the ordering is
+# guaranteed: stop-then-dispatch, never dispatch-then-stop.
+_sgt_prior_bg_id="$(tr -d '\n' < "$REPO_DIR/claude_background_id" 2>/dev/null || true)"
+if [[ -n "$_sgt_prior_bg_id" ]] && command -v claude >/dev/null 2>&1 && \
+   command -v jq >/dev/null 2>&1; then
+  _sgt_prior_state="$(claude agents --json 2>/dev/null | \
+    jq -r ".[] | select(.id == \"$_sgt_prior_bg_id\") | .state" 2>/dev/null || true)"
+  if [[ "$_sgt_prior_state" == "working" || "$_sgt_prior_state" == "blocked" ]]; then
+    claude stop "$_sgt_prior_bg_id" 2>/dev/null || true
+    printf 'stall-recovery preempted live prior claude background session: %s\n' \
+      "$_sgt_prior_bg_id" >> "$REPO_DIR/diagnostic" 2>/dev/null || true
+  fi
+fi
+unset _sgt_prior_bg_id _sgt_prior_state
+
 # Launch the new pane BEFORE killing the old one.  If the launch fails, the
 # original stalled pane remains alive and the worker is escalated to
 # needs_input for investigation.
@@ -331,6 +349,9 @@ printf '%s\n' "$new_pane" > "$REPO_DIR/pane"
 
 _abort_replacement() {
   local reason="$1"
+  # Claude-specific backstop: stop the background session that the new worker
+  # may have already launched before the failure, so no orphaned session runs.
+  _sgt_claude_stop_bg_session "$REPO_DIR"
   tmux kill-pane -t "$new_pane" 2>/dev/null || true
   if [[ -n "$old_pane" ]]; then
     printf '%s\n' "$old_pane" > "$REPO_DIR/pane" || true
@@ -353,8 +374,11 @@ fi
 # ── 14. Kill old pane (AFTER new pane is fully validated) ────────────────────
 # Only reached when the replacement pane is alive, identity-confirmed, and has
 # an active notification target.  Prefix-safe: identity was verified in step 7.
+# Claude backstop: the stalled old pane's background session was already stopped
+# in the prior-session check above; this call is idempotent.
 
 if $old_pane_live && [[ -n "$old_pane" ]]; then
+  _sgt_claude_stop_bg_session "$REPO_DIR"
   tmux kill-pane -t "$old_pane" 2>/dev/null || true
 fi
 
@@ -362,6 +386,9 @@ fi
 
 if ! _sgt_wait_worker_notification "$new_pane" "$REPO_DIR" \
     "$delivery_notification_id"; then
+  # Claude-specific backstop: stop any background session the relaunched worker
+  # may have started, then kill its pane.
+  _sgt_claude_stop_bg_session "$REPO_DIR"
   tmux kill-pane -t "$new_pane" 2>/dev/null || true
   _escalate "relaunched worker did not acknowledge recovery notification"
   _recover_die "Stall recovery failed: notification timed out for $TASK_ID/$REPO"

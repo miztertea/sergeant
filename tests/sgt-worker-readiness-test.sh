@@ -30,13 +30,38 @@ command -v tmux >/dev/null 2>&1 || {
 
 mkdir -p "$TEST_ROOT/fake-bin" "$TEST_ROOT/state" "$TEST_ROOT/worktree"
 
-# A harness that starts, renders absolutely nothing, and stays alive.  Readiness
-# can therefore never be satisfied, which is exactly the unreachable state the
-# bound has to report.
+# A fake claude CLI implementing the surface sgt-interactive-worker's Claude
+# pre-launch block requires (--help, --bg, agents --json, stop, respawn) so
+# capability gating and the post-launch liveness check succeed quickly.  Only
+# `attach` — the worker's actual persistent foreground slot — renders
+# absolutely nothing and stays alive, so readiness can never be satisfied,
+# which is exactly the unreachable state this test exercises.
 cat > "$TEST_ROOT/fake-bin/claude" <<'EOF'
 #!/usr/bin/env bash
-touch "$HARNESS_STARTED_FILE"
-while :; do sleep 1; done
+case "$1" in
+  --help)
+    echo "--bg attach stop agents respawn"
+    exit 0
+    ;;
+  --bg)
+    echo "fakebg1"
+    exit 0
+    ;;
+  agents)
+    echo '[{"id":"fakebg1","state":"working","sessionId":"fake-session-1"}]'
+    exit 0
+    ;;
+  stop|respawn)
+    exit 0
+    ;;
+  attach)
+    touch "$HARNESS_STARTED_FILE"
+    while :; do sleep 1; done
+    ;;
+  *)
+    exit 1
+    ;;
+esac
 EOF
 chmod +x "$TEST_ROOT/fake-bin/claude"
 
@@ -60,6 +85,8 @@ tmux new-window -d -t "$TMUX_SESSION:" -n unreachable \
   SGT_HARNESS_SETTLE_SECONDS=0 \
   SGT_PROGRESS_INTERVAL=600 \
   SGT_DRAIN_CHECK_INTERVAL=600 \
+  SGT_CLAUDE_LIVENESS_INTERVAL=0.02 \
+  SGT_CLAUDE_LIVENESS_ATTEMPTS=5 \
   '$ROOT_DIR/bin/sgt-interactive-worker' '$state' '$worktree' \
   '$TEST_ROOT/fake-bin/claude'"
 

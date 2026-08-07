@@ -129,6 +129,11 @@ for ((i=0; i<count; i++)); do
   pid="${eligible_pids[$i]:-}"
   repo_dir="$fleet_dir/$task_id/$repo_name"
 
+  # Claude-specific backstop: stop the background session before signalling the
+  # worker PID.  A background Claude session is not a child of the worker's
+  # process group and is invisible to process-group signalling.  Idempotent.
+  _sgt_claude_stop_bg_session "$repo_dir"
+
   if [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]]; then
     if kill -0 "$pid" 2>/dev/null; then
       # Verify identity: recorded start time must match actual process start time

@@ -131,7 +131,37 @@ chmod +x "$TEST_ROOT/fake-bin/_harness-body"
 
 while IFS= read -r harness; do
   [[ -n "$harness" ]] || continue
-  ln -sf _harness-body "$TEST_ROOT/fake-bin/$harness"
+  if [[ "$harness" == "claude" ]]; then
+    # Claude's launch mechanics differ fundamentally from every other harness
+    # (Claude Background Harness PRD): sgt-interactive-worker launches a
+    # background session (--bg), inspects it (agents --json), then holds the
+    # worker's persistent foreground slot on `attach <id>` instead of a bare
+    # invocation.  A bare symlink to _harness-body no longer represents that.
+    # This fake handles the claude-specific subcommands directly and delegates
+    # `attach` to the exact same _harness-body every other harness uses, after
+    # shifting away the `attach <id>` prefix so the handshake body still sees
+    # a bare invocation the same way it always has.
+    # A fixed literal id, not one derived from $$: --bg, agents, and attach are
+    # each a genuinely separate process invocation with no shared PID to key
+    # off, so a per-invocation-unique id would never match across calls.
+    cat > "$TEST_ROOT/fake-bin/claude" <<'CLAUDEFAKE'
+#!/usr/bin/env bash
+case "$1" in
+  --help) echo "--bg attach stop agents respawn"; exit 0 ;;
+  --bg) echo "handshake-bg-1"; exit 0 ;;
+  agents) echo '[{"id":"handshake-bg-1","state":"working","sessionId":"handshake-session-1"}]'; exit 0 ;;
+  stop|respawn) exit 0 ;;
+  attach)
+    shift 2
+    exec "$(dirname "$0")/_harness-body" "$@"
+    ;;
+  *) exit 1 ;;
+esac
+CLAUDEFAKE
+    chmod +x "$TEST_ROOT/fake-bin/claude"
+  else
+    ln -sf _harness-body "$TEST_ROOT/fake-bin/$harness"
+  fi
 done <<EOF
 $HARNESSES
 EOF

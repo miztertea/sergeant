@@ -932,6 +932,9 @@ $td_context_block"
         _die "Could not publish worker pane identity"
       if ! _sgt_notification_target_create "$repo_task_dir" "$initial_notification_id" \
           "$pane_identity" >/dev/null; then
+        # Claude-specific backstop: stop any background session the worker may
+        # already have launched before the notification target race was detected.
+        _sgt_claude_stop_bg_session "$repo_task_dir"
         tmux kill-pane -t "$pane_target" 2>/dev/null || true
         printf 'orphaned\n' > "$repo_task_dir/status"
         printf 'notification target creation race: concurrent dispatch detected\n' > "$repo_task_dir/diagnostic"
@@ -939,6 +942,9 @@ $td_context_block"
         _die "notification target race detected for $rname; worker orphaned"
       fi
     else
+      # Claude-specific backstop: stop any background session the worker may
+      # already have launched before the pane identity capture failed.
+      _sgt_claude_stop_bg_session "$repo_task_dir"
       tmux kill-pane -t "$pane_target" 2>/dev/null || true
       printf 'orphaned\n' > "$repo_task_dir/status"
       printf 'tmux failed to capture exact worker pane identity\n' > "$repo_task_dir/diagnostic"
@@ -946,6 +952,9 @@ $td_context_block"
       _die "tmux failed to capture exact worker pane identity for $rname"
     fi
     if ! _sgt_wait_worker_notification "$pane_target" "$repo_task_dir" "$initial_notification_id"; then
+      # Claude-specific backstop: stop any background session the worker may
+      # have launched before the notification acknowledgement timed out.
+      _sgt_claude_stop_bg_session "$repo_task_dir"
       tmux kill-pane -t "$pane_target" 2>/dev/null || true
       printf 'orphaned\n' > "$repo_task_dir/status"
       printf 'interactive worker did not acknowledge its durable notification\n' > "$repo_task_dir/diagnostic"

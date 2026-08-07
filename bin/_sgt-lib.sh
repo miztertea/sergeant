@@ -98,7 +98,13 @@ _sgt_harness_launch_contract() {
   case "$1" in
     opencode|oc) printf 'argv-qualified agent-definition any --dangerously-skip-permissions\n' ;;
     goose)       printf 'env-goose unknown any session\n' ;;
-    claude)      printf 'unmeasured unmeasured unmeasured -\n' ;;
+    # Claude's --model accepts a bare alias or full ID directly as argv, with no
+    # provider qualification (measured: a qualified form causes session failure, not
+    # launch rejection).  The provider_scope=anthropic check validates and strips
+    # the provider segment before it reaches the argv-bare assembly below.
+    # base_argv is set dynamically in sgt-interactive-worker after claude --bg
+    # returns the background ID; the "-" placeholder here is overwritten at launch.
+    claude)      printf 'argv-bare unmeasured anthropic -\n' ;;
     *)           return 1 ;;
   esac
 }
@@ -254,6 +260,16 @@ _sgt_resolve_agent_launch() {
       SGT_LAUNCH_MODEL_ARGV=(--model "$SGT_AGENT_MODEL_PROVIDER/$SGT_AGENT_MODEL_ID")
       # The provider travels in the argument, so the invocation proves it.
       SGT_LAUNCH_PROVIDER_VERIFIED="true"
+      ;;
+    argv-bare)
+      # Pass only the model ID; the provider segment is validated by the
+      # provider_scope check above and stripped before reaching the harness.
+      # The harness's own --model grammar requires a bare alias or full ID
+      # with no provider qualification (measured: a qualified form fails the
+      # session, not just the launch call).  The provider does not travel in
+      # the argv, so the invocation does not independently prove it.
+      SGT_LAUNCH_MODEL_ARGV=(--model "$SGT_AGENT_MODEL_ID")
+      SGT_LAUNCH_PROVIDER_VERIFIED="false"
       ;;
     env-goose)
       SGT_LAUNCH_MODEL_ENV=("GOOSE_PROVIDER=$SGT_AGENT_MODEL_PROVIDER" \
