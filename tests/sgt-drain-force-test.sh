@@ -25,6 +25,24 @@ printf 'myproject\n'       > "$repo2/project"
 printf 'needs_input\n'     > "$repo2/status"
 printf 'needs_input\n'     > "$worktree2/.sergeant-status"
 
+# Fake claude binary recording every "stop <id>" call, so the force-stop
+# loop's claude-specific backstop (bin/sgt-drain-force's call to
+# _sgt_claude_stop_bg_session) can be proven by an actual observed call
+# rather than by grepping the call site's source text.
+fake_bin="$TEST_ROOT/fake-bin"
+claude_stop_log="$TEST_ROOT/claude-stop-calls.log"
+mkdir -p "$fake_bin"
+cat > "$fake_bin/claude" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "stop" ]]; then
+  printf '%s\n' "\$2" >> "$claude_stop_log"
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$fake_bin/claude"
+printf 'fake-bg-1\n' > "$repo1/claude_background_id"
+
 _drain() {
   SERGEANT_DRAIN_DIR="$drain_dir" SERGEANT_FLEET="$fleet_dir" \
     "$ROOT_DIR/bin/sgt-drain" "$@"
@@ -57,7 +75,7 @@ SGT_FORCE="$ROOT_DIR/bin/sgt-drain-force"
 }
 
 _force() {
-  SERGEANT_DRAIN_DIR="$drain_dir" SERGEANT_FLEET="$fleet_dir" \
+  SERGEANT_DRAIN_DIR="$drain_dir" SERGEANT_FLEET="$fleet_dir" PATH="$fake_bin:$PATH" \
     "$SGT_FORCE" "$@"
 }
 
@@ -122,6 +140,10 @@ status2="$(cat "$worktree2/.sergeant-status" 2>/dev/null || echo "")"
   { echo "worker2 status after force wrong: $status2"; exit 1; }
 kill -0 "$fake_pid1" 2>/dev/null && { echo "fake pid1 still alive"; kill "$fake_pid1"; exit 1; } || true
 kill -0 "$fake_pid2" 2>/dev/null && { echo "fake pid2 still alive"; kill "$fake_pid2"; exit 1; } || true
+grep -qF 'fake-bg-1' "$claude_stop_log" || {
+  echo "force-stop did not call claude stop for the recorded background id"
+  exit 1
+}
 
 # ── 5. Unrelated project workers survive project-scoped force ─────────────────
 

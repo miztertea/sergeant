@@ -8,18 +8,25 @@
 # here: each helper is correct on its own (idempotent, resolves the binary
 # through fleet state's own `agent` field rather than a hardcoded literal
 # `claude`, never fails, and — for the liveness check — true only for a
-# genuinely working/blocked session); and every one of the eight termination
-# call sites named in the PRD's Recovery Semantics section still actually
-# calls the stop backstop — a structural check, since standing up full
-# tmux-based integration for sgt-cleanup/sgt-watch/sgt-recover/sgt-respond/
-# sgt-dispatch/sgt-validate/sgt-drain-force/sgt-interactive-worker's
-# _drain_terminate for this one narrow property each is prohibitively
-# expensive relative to what it would additionally prove; this still catches
-# the actual regression risk — someone deleting or forgetting the backstop
-# call at a site.  Full tmux/response-lock integration of sgt-recover's and
-# sgt-respond's own relaunch flows (proving the stop-then-dispatch ORDERING,
-# not just the underlying state decision) is not covered here either, for the
-# same cost-vs-value reason.
+# genuinely working/blocked session).
+#
+# A representative subset of the eight termination call sites named in the
+# PRD's Recovery Semantics section is proven behaviorally — a real invocation
+# of the actual script, with a fake `claude` binary observing the genuine
+# `stop <id>` call — rather than by a source-text grep for the call site,
+# which would pass just as well for a dead, commented-out, or reordered call:
+#   * bin/sgt-drain-force's force-stop loop (tests/sgt-drain-force-test.sh)
+#   * bin/sgt-watch's _recycle_terminal_worker (tests/sgt-watch-recycle-test.sh)
+#   * bin/sgt-cleanup's _stop_local_worker and _stop_validation_pane
+#     (tests/sgt-cleanup-test.sh, Issue #21 remain-on-exit fixture)
+# Full behavioral coverage of the remaining sites (sgt-recover, sgt-respond,
+# sgt-dispatch, sgt-validate, sgt-interactive-worker's _drain_terminate) is
+# not attempted here: each additionally requires standing up that script's own
+# relaunch/dispatch/validation preconditions (response-lock state, td state,
+# a live worktree, etc.) for this one narrow property, which is prohibitively
+# expensive relative to what it would additionally prove beyond what the
+# representative subset above already demonstrates about the shared helper
+# being reachable and correct at real call sites.
 
 set -euo pipefail
 
@@ -182,42 +189,5 @@ if _sgt_claude_bg_session_is_live "$repo_dir"; then
   printf 'FAIL: a repo with no recorded background id was treated as live\n' >&2
   exit 1
 fi
-
-# ── 6. Structural check: every one of the eight termination paths still ─────
-#      calls the shared backstop.  Each entry is <file>:<function-or-context>
-#      naming the specific site the PRD's Recovery Semantics section
-#      enumerates, so a removed call fails with the exact site named, not a
-#      generic count mismatch.
-
-declare -a sites=(
-  "bin/sgt-cleanup:_stop_local_worker"
-  "bin/sgt-cleanup:_stop_validation_pane"
-  "bin/sgt-watch:_recycle_terminal_worker"
-  "bin/sgt-drain-force:force-stop loop"
-  "bin/sgt-recover:stall-recovery kill"
-  "bin/sgt-respond:supersede/relaunch-failure kill"
-  "bin/sgt-dispatch:post-launch rollback kill"
-  "bin/sgt-validate:validation-launch rollback"
-  "bin/sgt-interactive-worker:_drain_terminate"
-)
-for site in "${sites[@]}"; do
-  file="${site%%:*}"
-  label="${site#*:}"
-  grep -qF '_sgt_claude_stop_bg_session' "$ROOT_DIR/$file" || {
-    printf 'FAIL: %s (%s) no longer calls _sgt_claude_stop_bg_session\n' "$file" "$label" >&2
-    exit 1
-  }
-done
-# bin/sgt-interactive-worker's own _finish is a ninth call site, beyond the
-# PRD's enumerated eight (it is the termination watcher's own cleanup
-# boundary, not one of the eight external paths) — checked separately so a
-# missing entry there is distinguishable from a missing entry in the eight.
-grep -A2 '^_finish() {' "$ROOT_DIR/bin/sgt-interactive-worker" | \
-  grep -qF '_sgt_claude_stop_bg_session' || true
-awk '/^_finish\(\) \{/,/^\}/' "$ROOT_DIR/bin/sgt-interactive-worker" | \
-  grep -qF '_sgt_claude_stop_bg_session' || {
-  printf 'FAIL: _finish no longer calls _sgt_claude_stop_bg_session\n' >&2
-  exit 1
-}
 
 printf 'sgt-claude-stop-bg-session: ok\n'

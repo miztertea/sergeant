@@ -862,6 +862,21 @@ if [[ "$harness" == "claude" ]]; then
     exit 2
   fi
 
+  # Fail closed on a malformed background ID here, at capture time, rather
+  # than relying on _sgt_claude_bg_id_and_bin's read-side charset check to
+  # coincidentally match whatever the CLI happened to emit.  Every one of the
+  # nine termination-path backstops resolves the id through that same regex
+  # (bin/_sgt-drain.sh), so an id outside this shape would otherwise get
+  # persisted and later silently defeat every one of those backstops.
+  if [[ ! "$_SGT_CLAUDE_BG_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'failed: claude --bg returned malformed background ID: %s\n' \
+      "$_SGT_CLAUDE_BG_ID" > "$REPO_STATE/status"
+    printf 'failed: claude --bg returned malformed background ID: %s\n' \
+      "$_SGT_CLAUDE_BG_ID" > "$WORKTREE/.sergeant-status"
+    echo "ERROR: claude --bg returned malformed background ID: $_SGT_CLAUDE_BG_ID" >&2
+    exit 2
+  fi
+
   # Persist the background ID immediately, before the liveness check loop
   # below (which can take several real seconds against a genuine API call,
   # not just its bounded worst case) — not after it.  A worker process death

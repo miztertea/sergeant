@@ -75,6 +75,21 @@ exit 0
 TD
 chmod +x "$fake_bin/td"
 
+# Fake claude binary recording every "stop <id>" call, so recycling's
+# claude-specific backstop (bin/sgt-watch's call to _sgt_claude_stop_bg_session
+# inside _recycle_terminal_worker) can be proven by an actual observed call
+# rather than by grepping the call site's source text.
+export CLAUDE_STOP_LOG="$TEST_ROOT/claude-stop-calls.log"
+cat > "$fake_bin/claude" <<'CLAUDE'
+#!/usr/bin/env bash
+if [[ "$1" == "stop" ]]; then
+  printf '%s\n' "$2" >> "$CLAUDE_STOP_LOG"
+  exit 0
+fi
+exit 1
+CLAUDE
+chmod +x "$fake_bin/claude"
+
 export LIVE_PANES="$TEST_ROOT/live-panes"
 export KILL_LOG="$TEST_ROOT/kill.log"
 export IDENTITY_DIR="$TEST_ROOT/identities"
@@ -149,9 +164,14 @@ grep -Fq '0|%10|4242|123456|worker' "$state/worker_recycled" || {
 # ── 2. done and failed are still recycled ────────────────────────────────────
 
 read -r state wt <<<"$(make_worker done done '%11')"
+printf 'done-bg-1\n' > "$state/claude_background_id"
 env "PATH=$fake_bin:$PATH" "SERGEANT_FLEET=$fleet" \
   "$ROOT_DIR/bin/sgt-watch" --sync task-done >/dev/null
 _pane_live '%11' && { printf 'a done worker pane was not recycled\n' >&2; exit 1; }
+grep -qF 'done-bg-1' "$CLAUDE_STOP_LOG" 2>/dev/null || {
+  printf 'FAIL: recycling a done worker did not call claude stop for its background id\n' >&2
+  exit 1
+}
 
 read -r state wt <<<"$(make_worker failed 'failed: deliberate' '%12')"
 env "PATH=$fake_bin:$PATH" "SERGEANT_FLEET=$fleet" \

@@ -8,11 +8,13 @@
 # What this file does NOT cover: CH-5 (the real-Claude contract test, which
 # needs the genuine `stop`-causes-`attach`-to-exit behavior and is documented
 # separately for manual/CI re-run before trusting a Claude Code version), and
-# full tmux-based integration of the eight termination paths across
-# sgt-cleanup/sgt-watch/sgt-recover/sgt-respond/sgt-dispatch/sgt-validate/
-# sgt-drain-force (tests/sgt-claude-stop-bg-session-test.sh covers the shared
-# backstop helper's own correctness directly, plus a structural check that
-# every one of the eight call sites still invokes it).
+# full tmux-based integration of every one of the eight termination paths
+# across sgt-cleanup/sgt-watch/sgt-recover/sgt-respond/sgt-dispatch/
+# sgt-validate/sgt-drain-force (tests/sgt-claude-stop-bg-session-test.sh
+# covers the shared backstop helper's own correctness directly; a
+# representative subset of the eight call sites — sgt-drain-force, sgt-watch,
+# and both sgt-cleanup sites — are proven behaviorally in their own dedicated
+# test files, per that file's header comment).
 
 set -euo pipefail
 
@@ -382,26 +384,37 @@ tmux kill-window -t "$TMUX_SESSION:preflight-reject" 2>/dev/null || true
 # ── 10b. Model pin shaped enough for Sergeant's shared tuple grammar but not ──
 #         for Claude's own pre-flight regex (Claude Harness Lifecycle layer 1)
 # "not-a-claude-model" clears _SGT_AGENT_MODEL_RE (alnum/dot/dash/underscore)
-# and the provider-scope check (anthropic), so it would reach sgt-interactive-
+# and the provider-scope check (anthropic), so it reaches sgt-interactive-
 # worker's own _SGT_CLAUDE_MODEL_RE — which must still reject it, distinguishing
 # this layer from case 10's rejection at the shared-grammar layer.
 #
-# Checked as a direct pattern match rather than a full worker spawn: case 11
-# below already exercises this exact regex's ACCEPT path end-to-end (a launch
-# that reaches --bg and completes has necessarily passed this check), so this
-# case only needs to prove the REJECT path for a shaped-but-wrong value, which
-# a pattern match against the literal regex sgt-interactive-worker defines
-# proves just as rigorously without spawning another tmux worker.
-_sgt_claude_model_re="$(sed -n 's/^  _SGT_CLAUDE_MODEL_RE=.//p' "$ROOT_DIR/bin/sgt-interactive-worker" | \
-  sed "s/'\$//")"
-[[ -n "$_sgt_claude_model_re" ]] || {
-  printf 'FAIL: could not extract _SGT_CLAUDE_MODEL_RE from sgt-interactive-worker\n' >&2
+# Spawns the real worker, mirroring case 10's structure: the observable
+# rejection (a failed status, no --bg call ever made) is what's asserted, not
+# the regex text itself.
+
+_fake_claude "$TEST_ROOT/claude-preflight-reject" '
+  --bg) touch "'"$TEST_ROOT"'/claude-preflight-reject/bg-called"; echo "should-not-run"; exit 0 ;;'
+mkdir -p "$TEST_ROOT/claude-preflight-reject/state" "$TEST_ROOT/claude-preflight-reject/worktree"
+printf 'anthropic/not-a-claude-model\n' > "$TEST_ROOT/claude-preflight-reject/state/agent_model"
+printf 'flag\n' > "$TEST_ROOT/claude-preflight-reject/state/agent_model_source"
+printf 'in_progress\n' > "$TEST_ROOT/claude-preflight-reject/worktree/.sergeant-status"
+tmux new-window -d -t "$TMUX_SESSION:" -n claude-preflight-reject \
+  "'$ROOT_DIR/bin/sgt-interactive-worker' '$TEST_ROOT/claude-preflight-reject/state' \
+  '$TEST_ROOT/claude-preflight-reject/worktree' '$TEST_ROOT/claude-preflight-reject/claude'"
+for _ in $(seq 1 800); do
+  [[ -s "$TEST_ROOT/claude-preflight-reject/state/status" ]] && break
+  sleep 0.02
+done
+[[ "$(cat "$TEST_ROOT/claude-preflight-reject/state/status" 2>/dev/null || true)" == failed:* ]] || {
+  printf 'FAIL: a shaped-but-non-claude model was not rejected: %s\n' \
+    "$(cat "$TEST_ROOT/claude-preflight-reject/state/status" 2>/dev/null || true)" >&2
   exit 1
 }
-if [[ "not-a-claude-model" =~ $_sgt_claude_model_re ]]; then
-  printf 'FAIL: a shaped-but-non-claude model matched the Claude-specific pre-flight regex\n' >&2
+[[ ! -e "$TEST_ROOT/claude-preflight-reject/bg-called" ]] || {
+  printf 'FAIL: claude --bg was invoked despite a shaped-but-non-claude pinned model\n' >&2
   exit 1
-fi
+}
+tmux kill-window -t "$TMUX_SESSION:claude-preflight-reject" 2>/dev/null || true
 
 # ── 11. Model pin, valid alias reaching the Claude-specific regex directly ────
 # Exercise sgt-interactive-worker's OWN pre-flight regex (Claude Harness
