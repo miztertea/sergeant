@@ -163,7 +163,7 @@ grep -Fq '0|%10|4242|123456|worker' "$state/worker_recycled" || {
 
 # ── 2. done and failed are still recycled ────────────────────────────────────
 
-read -r state wt <<<"$(make_worker done done '%11')"
+read -r state wt <<<"$(make_worker "done" "done" '%11')"
 printf 'done-bg-1\n' > "$state/claude_background_id"
 env "PATH=$fake_bin:$PATH" "SERGEANT_FLEET=$fleet" \
   "$ROOT_DIR/bin/sgt-watch" --sync task-done >/dev/null
@@ -200,7 +200,7 @@ done
 
 # ── 4. Recycling is idempotent for an unchanged pane identity ────────────────
 
-read -r state wt <<<"$(make_worker idempotent done '%30')"
+read -r state wt <<<"$(make_worker idempotent "done" '%30')"
 env "PATH=$fake_bin:$PATH" "SERGEANT_FLEET=$fleet" \
   "$ROOT_DIR/bin/sgt-watch" --sync task-idempotent >/dev/null
 first_evidence="$(cat "$state/worker_recycled")"
@@ -220,7 +220,7 @@ env "PATH=$fake_bin:$PATH" "SERGEANT_FLEET=$fleet" \
 # This is the core td-b377a0 defect: after any stamped marker, a rewritten
 # pane/pane_identity must still be recycled rather than permanently suppressed.
 
-read -r state wt <<<"$(make_worker relaunch done '%40')"
+read -r state wt <<<"$(make_worker relaunch "done" '%40')"
 env "PATH=$fake_bin:$PATH" "SERGEANT_FLEET=$fleet" \
   "$ROOT_DIR/bin/sgt-watch" --sync task-relaunch >/dev/null
 _pane_live '%40' && { printf 'the first pane was not recycled\n' >&2; exit 1; }
@@ -257,7 +257,7 @@ grep -Fq '%40' "$state/worker_recycled_log" && grep -Fq '%41' "$state/worker_rec
 # The guard must never accept a truncated marker as evidence that a live pane was
 # already retired.
 
-read -r state wt <<<"$(make_worker emptymarker done '%50')"
+read -r state wt <<<"$(make_worker emptymarker "done" '%50')"
 : > "$state/worker_recycled"
 env "PATH=$fake_bin:$PATH" "SERGEANT_FLEET=$fleet" \
   "$ROOT_DIR/bin/sgt-watch" --sync task-emptymarker >/dev/null
@@ -266,7 +266,7 @@ if _pane_live '%50'; then
   exit 1
 fi
 
-read -r state wt <<<"$(make_worker garbagemarker done '%51')"
+read -r state wt <<<"$(make_worker garbagemarker "done" '%51')"
 printf 'recycled\n' > "$state/worker_recycled"
 env "PATH=$fake_bin:$PATH" "SERGEANT_FLEET=$fleet" \
   "$ROOT_DIR/bin/sgt-watch" --sync task-garbagemarker >/dev/null
@@ -277,7 +277,7 @@ fi
 
 # ── 7. An identity mismatch refuses to recycle ───────────────────────────────
 
-read -r state wt <<<"$(make_worker mismatch done '%60')"
+read -r state wt <<<"$(make_worker mismatch "done" '%60')"
 # Fleet state records one identity while the live pane reports another.
 printf '0|%%60|9999|777777|someone-else\n' > "$state/pane_identity"
 chmod 600 "$state/pane_identity"
@@ -299,7 +299,7 @@ grep -Fq 'identity' "$state/diagnostic" || {
 
 # ── 8. An absent pane records evidence without claiming a kill ───────────────
 
-read -r state wt <<<"$(make_worker absent done '%70')"
+read -r state wt <<<"$(make_worker absent "done" '%70')"
 grep -v -x '%70' "$LIVE_PANES" > "$LIVE_PANES.tmp" || true
 mv "$LIVE_PANES.tmp" "$LIVE_PANES"
 kills_before="$(wc -l < "$KILL_LOG" | tr -d ' ')"

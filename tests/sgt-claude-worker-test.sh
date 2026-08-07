@@ -387,7 +387,8 @@ tmux new-window -d -t "$TMUX_SESSION:" -n preflight-reject \
   "'$ROOT_DIR/bin/sgt-interactive-worker' '$TEST_ROOT/preflight-reject/state' \
   '$TEST_ROOT/preflight-reject/worktree' '$TEST_ROOT/preflight-reject/claude'"
 for _ in $(seq 1 800); do
-  [[ -s "$TEST_ROOT/preflight-reject/state/status" ]] && break
+  [[ -s "$TEST_ROOT/preflight-reject/state/status" ]] && \
+    [[ "$(cat "$TEST_ROOT/preflight-reject/state/status")" == failed:* ]] && break
   sleep 0.02
 done
 # This tuple is malformed against Sergeant's own pinned-tuple grammar
@@ -426,7 +427,8 @@ tmux new-window -d -t "$TMUX_SESSION:" -n claude-preflight-reject \
   "'$ROOT_DIR/bin/sgt-interactive-worker' '$TEST_ROOT/claude-preflight-reject/state' \
   '$TEST_ROOT/claude-preflight-reject/worktree' '$TEST_ROOT/claude-preflight-reject/claude'"
 for _ in $(seq 1 800); do
-  [[ -s "$TEST_ROOT/claude-preflight-reject/state/status" ]] && break
+  [[ -s "$TEST_ROOT/claude-preflight-reject/state/status" ]] && \
+    [[ "$(cat "$TEST_ROOT/claude-preflight-reject/state/status")" == failed:* ]] && break
   sleep 0.02
 done
 [[ "$(cat "$TEST_ROOT/claude-preflight-reject/state/status" 2>/dev/null || true)" == failed:* ]] || {
