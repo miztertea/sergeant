@@ -175,6 +175,30 @@ done
 }
 tmux kill-window -t "$TMUX_SESSION:bg-empty" 2>/dev/null || true
 
+# ── 3b. Launch failure: claude --bg returns a non-empty but malformed id ─────
+# Whitespace is stripped before the charset check runs, so a bare space would
+# not exercise it; a leading dash is outside the id's own charset and survives
+# stripping, so it does.
+
+_fake_claude "$TEST_ROOT/bg-malformed" '
+  --bg) echo "-bad/id"; exit 0 ;;'
+_launch bg-malformed "$TEST_ROOT/bg-malformed"
+for _ in $(seq 1 800); do
+  [[ -s "$TEST_ROOT/bg-malformed/state/status" ]] && \
+    [[ "$(cat "$TEST_ROOT/bg-malformed/state/status")" == failed:* ]] && break
+  sleep 0.02
+done
+[[ "$(cat "$TEST_ROOT/bg-malformed/state/status" 2>/dev/null || true)" == failed:* ]] || {
+  printf 'FAIL: a malformed --bg id did not fail closed: %s\n' \
+    "$(cat "$TEST_ROOT/bg-malformed/state/status" 2>/dev/null || true)" >&2
+  exit 1
+}
+[[ ! -f "$TEST_ROOT/bg-malformed/state/claude_background_id" ]] || {
+  printf 'FAIL: a malformed background id was persisted despite failing closed\n' >&2
+  exit 1
+}
+tmux kill-window -t "$TMUX_SESSION:bg-malformed" 2>/dev/null || true
+
 # ── 4. Model verification layer 2: bounded post-launch liveness catches a ────
 #      shaped-but-invalid pin (state reaches "failed" within the bound)
 
