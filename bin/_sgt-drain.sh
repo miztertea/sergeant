@@ -13,7 +13,9 @@
 #           _sgt_drain_process_start,
 #           _sgt_drain_lock_acquire_fd, _sgt_drain_lock_release_fd,
 #           _sgt_drain_check_admission_locked, _sgt_drain_run_locked,
-#           _sgt_drain_remove_global, _sgt_drain_remove_project
+#           _sgt_drain_remove_global, _sgt_drain_remove_project,
+#           _sgt_claude_bg_id_and_bin, _sgt_claude_stop_bg_session,
+#           _sgt_claude_bg_session_is_live
 #
 # Drain state location: $SERGEANT_CONFIG/drain/
 #   Global drain:  $SERGEANT_CONFIG/drain/global
@@ -657,4 +659,92 @@ _sgt_drain_remove_project() {
   local drain_file
   drain_file="$(_sgt_drain_project_file "$project")"
   _sgt_drain_run_locked rm -f "$drain_file"
+}
+
+# _sgt_claude_bg_id_and_bin <repo_dir>
+#
+# Prints "<background-id> <resolved-binary>" on success, or nothing when no
+# valid background id is recorded.  Shared by every Claude-aware caller that
+# needs both values, so the resolution rule (and the redirection caveat below)
+# is written exactly once.
+#
+# `cat` is used deliberately, not `<` input redirection: an input redirection
+# from a missing path fails before `tr`/`2>/dev/null` ever takes effect, so the
+# shell would report its own "No such file or directory" for every
+# legitimately absent field (same caveat as sgt-cleanup's _response_state_field).
+#
+# The binary is resolved from fleet state's own recorded `agent` field (the
+# same field _sgt_worker_command already uses to relaunch a worker), falling
+# back to a bare `claude` lookup on PATH for fleet state that predates this
+# field.  Resolving through the recorded agent path — rather than a hardcoded
+# literal `claude` — keeps every caller testable through the same single-seam
+# fake-binary pattern every other harness-launch test in this tree already uses.
+_sgt_claude_bg_id_and_bin() {
+  local repo_dir="$1" bg_id claude_bin
+  [[ -d "$repo_dir" ]] || return 1
+  bg_id="$(cat "$repo_dir/claude_background_id" 2>/dev/null | tr -d '\n' || true)"
+  [[ -n "$bg_id" && "$bg_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+  claude_bin="$(cat "$repo_dir/agent" 2>/dev/null | tr -d '\n' || true)"
+  [[ -n "$claude_bin" ]] || claude_bin="claude"
+  command -v "$claude_bin" >/dev/null 2>&1 || return 1
+  printf '%s %s\n' "$bg_id" "$claude_bin"
+}
+
+# _sgt_claude_stop_bg_session <repo_dir>
+#
+# Read the persisted claude_background_id from fleet state and call
+# `<agent> stop <id>`, idempotently.
+#
+# Never fails: a missing id, an unresolvable binary, or a repeated stop on an
+# already-stopped session are all silent no-ops.  A background Claude session
+# is not a child of the worker's process group and is invisible to
+# process-tree or tmux kill-pane signals; every termination path that kills a
+# pane or process must also call this function to prevent silent session leaks.
+#
+# Session-id cross-check (PRD Privacy and Security Constraints: "every
+# destructive operation ... verifies the recorded id and sessionId against the
+# live session before acting"): when both a recorded claude_session_id and a
+# live sessionId for this exact background id are available, a mismatch skips
+# the stop — the recorded id has been reused by an unrelated session, and
+# stopping it would affect the wrong one.  This check is deliberately
+# best-effort, not fail-closed: an unresolvable session_id (not yet persisted,
+# jq unavailable, or the query itself failing) still calls stop, because the
+# backstop's primary job — preventing a genuinely leaked live session from
+# running forever — must not be defeated by an unrelated, transient
+# verification failure.  Only a confirmed, positive mismatch skips the call.
+_sgt_claude_stop_bg_session() {
+  local repo_dir="$1" bg_id claude_bin resolved recorded_session_id live_session_id
+  resolved="$(_sgt_claude_bg_id_and_bin "$repo_dir")" || return 0
+  bg_id="${resolved%% *}"
+  claude_bin="${resolved#* }"
+  recorded_session_id="$(cat "$repo_dir/claude_session_id" 2>/dev/null | tr -d '\n' || true)"
+  if [[ -n "$recorded_session_id" ]] && command -v jq >/dev/null 2>&1; then
+    live_session_id="$("$claude_bin" agents --json 2>/dev/null | \
+      jq -r ".[] | select(.id == \"$bg_id\") | .sessionId" 2>/dev/null || true)"
+    if [[ -n "$live_session_id" && "$live_session_id" != "$recorded_session_id" ]]; then
+      return 0
+    fi
+  fi
+  "$claude_bin" stop "$bg_id" 2>/dev/null || true
+}
+
+# _sgt_claude_bg_session_is_live <repo_dir>
+#
+# 0 (true) only when a recorded Claude background session is genuinely still
+# running (state working or blocked) — the check sgt-recover's stall-recovery
+# relaunch and sgt-respond's superseded-worker relaunch both need before
+# dispatching a replacement worker, so a still-computing prior session is
+# never left running concurrently with the new one (PRD Recovery Semantics).
+# False for a missing id, an unresolvable binary, jq being unavailable, or any
+# state other than working/blocked (stopped, failed, or unrecognised) — every
+# one of those is "not provably live", which is what authorises proceeding.
+_sgt_claude_bg_session_is_live() {
+  local repo_dir="$1" bg_id claude_bin resolved state
+  command -v jq >/dev/null 2>&1 || return 1
+  resolved="$(_sgt_claude_bg_id_and_bin "$repo_dir")" || return 1
+  bg_id="${resolved%% *}"
+  claude_bin="${resolved#* }"
+  state="$("$claude_bin" agents --json 2>/dev/null | \
+    jq -r ".[] | select(.id == \"$bg_id\") | .state" 2>/dev/null || true)"
+  [[ "$state" == "working" || "$state" == "blocked" ]]
 }

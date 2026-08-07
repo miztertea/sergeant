@@ -55,6 +55,15 @@ AGENT_CMD="${SERGEANT_AGENT:-$(_sgt_detect_agent)}"
 #        argv-qualified  argv "--model <provider>/<model>".  OpenCode's help
 #                        Options block: "-m, --model  model to use in the format
 #                        of provider/model".
+#        argv-bare       argv "--model <model>", with no provider qualification
+#                        at all — the provider segment is validated against the
+#                        harness's own fixed provider_scope value and stripped
+#                        before it reaches the argv (see provider_scope below),
+#                        never passed through.  Measured for Claude: a bare
+#                        alias or full model ID as direct argv; a qualified
+#                        provider/model form reaching --model fails the
+#                        session outright, so this transport must never carry
+#                        the provider segment through.
 #        env-goose       env GOOSE_PROVIDER + GOOSE_MODEL.  "goose session"
 #                        exposes no model or provider flag, so the environment is
 #                        its only launch-time selector; this is legitimate
@@ -89,6 +98,11 @@ AGENT_CMD="${SERGEANT_AGENT:-$(_sgt_detect_agent)}"
 #   3. provider_scope — which providers the harness can be pinned to.
 #        any             the provider travels to the harness explicitly, so it is
 #                        verifiable from the launch invocation itself.
+#        <fixed-value>   (e.g. "anthropic") the harness accepts a pin for
+#                        exactly this one provider; any other provider is
+#                        rejected before any launch is attempted, and this
+#                        exact string never reaches the harness's own argv —
+#                        see argv-bare above for why it must be stripped.
 #        unmeasured      the harness's provider surface has not been observed.
 #
 #   4. base_argv — the words that start a persistent interactive session, or "-"
@@ -98,7 +112,13 @@ _sgt_harness_launch_contract() {
   case "$1" in
     opencode|oc) printf 'argv-qualified agent-definition any --dangerously-skip-permissions\n' ;;
     goose)       printf 'env-goose unknown any session\n' ;;
-    claude)      printf 'unmeasured unmeasured unmeasured -\n' ;;
+    # Claude's --model accepts a bare alias or full ID directly as argv, with no
+    # provider qualification (measured: a qualified form causes session failure, not
+    # launch rejection).  The provider_scope=anthropic check validates and strips
+    # the provider segment before it reaches the argv-bare assembly below.
+    # base_argv is set dynamically in sgt-interactive-worker after claude --bg
+    # returns the background ID; the "-" placeholder here is overwritten at launch.
+    claude)      printf 'argv-bare unmeasured anthropic -\n' ;;
     *)           return 1 ;;
   esac
 }
@@ -254,6 +274,16 @@ _sgt_resolve_agent_launch() {
       SGT_LAUNCH_MODEL_ARGV=(--model "$SGT_AGENT_MODEL_PROVIDER/$SGT_AGENT_MODEL_ID")
       # The provider travels in the argument, so the invocation proves it.
       SGT_LAUNCH_PROVIDER_VERIFIED="true"
+      ;;
+    argv-bare)
+      # Pass only the model ID; the provider segment is validated by the
+      # provider_scope check above and stripped before reaching the harness.
+      # The harness's own --model grammar requires a bare alias or full ID
+      # with no provider qualification (measured: a qualified form fails the
+      # session, not just the launch call).  The provider does not travel in
+      # the argv, so the invocation does not independently prove it.
+      SGT_LAUNCH_MODEL_ARGV=(--model "$SGT_AGENT_MODEL_ID")
+      SGT_LAUNCH_PROVIDER_VERIFIED="false"
       ;;
     env-goose)
       SGT_LAUNCH_MODEL_ENV=("GOOSE_PROVIDER=$SGT_AGENT_MODEL_PROVIDER" \

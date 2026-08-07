@@ -160,6 +160,11 @@ _drain_is_active() {
 # durable artefact has been written and the pane is gone.
 _drain_terminate() {
   local pgid attempts attempt
+  # Claude-specific backstop: stop the background session before signalling the
+  # process group, so the background session does not continue running after the
+  # pane and its process group are gone.  Idempotent — safe to call even if the
+  # termination watcher already stopped it.
+  _sgt_claude_stop_bg_session "$REPO_STATE"
   trap '' TERM
 
   pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
@@ -229,6 +234,46 @@ _do_drain() {
   _drain_terminate
 }
 
+# _watch_termination: Claude-only background loop that polls Sergeant's own durable
+# state and stops the background session once the mission reaches a terminal value
+# with a non-empty result.  This causes the blocked `claude attach` call to exit on
+# its own, which fires the installed EXIT trap (_finish) without any manual
+# process termination.
+#
+# The double guard (terminal status AND non-empty result) mirrors _finish's own
+# empty-result-means-orphaned handling and the required result-before-status write
+# order (templates/worker-brief.md:131-132).  Do not fire on status=done with an
+# empty result — that is an orphaned mission, not a completed one.
+#
+# The loop polls every SGT_TERMINATION_WATCHER_INTERVAL seconds (default 2).
+_watch_termination() {
+  local bg_id="$1" status result
+  [[ -n "$bg_id" ]] || return 0
+  while :; do
+    sleep "${SGT_TERMINATION_WATCHER_INTERVAL:-2}"
+    status="$(tr -d '\n' < "$WORKTREE/.sergeant-status" 2>/dev/null || true)"
+    case "$status" in
+      done)
+        result="$(cat "$WORKTREE/.sergeant-result" 2>/dev/null || true)"
+        if [[ -n "$result" ]]; then
+          # Terminal status with a result: the mission completed.  Stop the
+          # background session; this causes the attached process to exit on
+          # its own so _finish runs via the installed EXIT trap.
+          "$AGENT" stop "$bg_id" 2>/dev/null || true
+          return 0
+        fi
+        # done with empty result: orphaned mission.  Do not stop; let _finish
+        # handle the empty-result case when attach exits by other means.
+        ;;
+      failed:*)
+        # Any failed: <reason> value is terminal regardless of result state.
+        "$AGENT" stop "$bg_id" 2>/dev/null || true
+        return 0
+        ;;
+    esac
+  done
+}
+
 # _watch_drain: background loop — calls _do_drain when an active drain is detected.
 # Runs parallel to _watch_progress and _deliver_notifications.
 _watch_drain() {
@@ -257,6 +302,22 @@ _record_worker_identity() {
     printf '%s\n' "$pgid" > "$tmp" && mv "$tmp" "$REPO_STATE/worker_process_group" || return 0
   tmp="$(mktemp "$REPO_STATE/worker_process_start.XXXXXX")" && \
     printf '%s\n' "$start" > "$tmp" && mv "$tmp" "$REPO_STATE/worker_process_start" || return 0
+  # Persist the Claude background ID and session ID, if this worker is running
+  # a Claude background session.  Written here so every consumer — _drain_terminate
+  # (in-process) and the seven external termination paths (separate processes) —
+  # can read the same identity from fleet state with a uniform read pattern.
+  # _drain_terminate also holds $_SGT_CLAUDE_BG_ID as an inherited shell variable
+  # and may use it directly; persistence here is still required for the external paths.
+  if [[ -n "${_SGT_CLAUDE_BG_ID:-}" ]]; then
+    tmp="$(mktemp "$REPO_STATE/claude_background_id.XXXXXX")" && \
+      printf '%s\n' "$_SGT_CLAUDE_BG_ID" > "$tmp" && \
+      mv "$tmp" "$REPO_STATE/claude_background_id" || return 0
+  fi
+  if [[ -n "${_SGT_CLAUDE_SESSION_ID:-}" ]]; then
+    tmp="$(mktemp "$REPO_STATE/claude_session_id.XXXXXX")" && \
+      printf '%s\n' "$_SGT_CLAUDE_SESSION_ID" > "$tmp" && \
+      mv "$tmp" "$REPO_STATE/claude_session_id" || return 0
+  fi
 }
 _record_worker_identity
 
@@ -400,6 +461,19 @@ _finish() {
   [[ -z "${notification_pid:-}" ]] || kill "$notification_pid" 2>/dev/null || true
   [[ -z "${watch_progress_pid:-}" ]] || kill "$watch_progress_pid" 2>/dev/null || true
   [[ -z "${watch_drain_pid:-}" ]] || kill "$watch_drain_pid" 2>/dev/null || true
+  [[ -z "${watch_termination_pid:-}" ]] || kill "$watch_termination_pid" 2>/dev/null || true
+  # Claude-specific backstop: stop the background session from _finish so no
+  # background process leaks regardless of which exit path fires.  Idempotent
+  # — safe to call after the termination watcher or _drain_terminate already
+  # stopped it.  This is a ninth call site beyond the PRD's exhaustively-
+  # enumerated eight EXTERNAL termination paths (Recovery Semantics) — _finish
+  # runs inside this same worker process, as the terminal step of every exit
+  # path including ones none of the eight external scripts observe (e.g. a
+  # clean `done` exit with no external intervention at all), so it needs its
+  # own backstop independent of them.  Harmless and idempotent either way; a
+  # PRD revision should still record it as a ninth site rather than leave it
+  # implicit.
+  _sgt_claude_stop_bg_session "$REPO_STATE"
   # A background loop may have been killed mid-critical-section, leaving a
   # response lock recorded against this still-live PID.  Every loop is dead now,
   # so reclaiming our own lock is safe — and necessary, because acquiring it
@@ -634,6 +708,264 @@ printf 'interactive\n' > "$REPO_STATE/worker_mode"
 trap '_finish $?' EXIT
 
 cd "$WORKTREE" || exit 2
+
+# ── Claude background session pre-launch ────────────────────────────────────
+# The Claude harness requires a background ID that only exists after `claude --bg`
+# returns, so it cannot be expressed in the static contract table.  This block
+# runs BEFORE the three background loops start so the pane is clear and stable
+# when the readiness probe makes its first observation — closing the race described
+# in the PRD (Claude Harness Lifecycle).  No other harness uses this block.
+#
+# Scope note on "harness == claude" branching: the PRD/intent's Outcome-2 text
+# names three exceptions by label (launch-assembly, eight-path termination
+# backstop, relaunch prior-session check), but the PRD's own Claude Harness
+# Lifecycle section — which "launch-assembly" is drawn from — describes five
+# phases: Launch, Verify (the three model-verification layers), Steady state
+# (explicitly zero Claude code), Termination, and Unexpected death.  This
+# block, the termination-watcher start below, the respawn+reattach loop
+# wrapping the main invocation, and the post-invocation transcript scan
+# together implement exactly those five phases — none of them touch
+# _deliver_notifications/_watch_progress/_watch_drain/_finish's own logic
+# (the literal functions CH-2 names), and each maps onto a named PRD
+# subsection or an explicit Required-Invariant/State-Transition entry in
+# .sergeant-intent.md (the termination watcher's gating and the unexpected-
+# death respawn+reattach are both named in the intent's own State Transitions
+# section).  Flagged for the operator's confirmation that this reading of
+# Outcome 2 is the intended one, rather than silently narrowing the
+# implementation to only the three literal labels and dropping PRD-mandated
+# behavior (CH-1, CH-3) to fit.
+
+_SGT_CLAUDE_BG_ID=""
+_SGT_CLAUDE_SESSION_ID=""
+_SGT_CLAUDE_MODEL_PINNED="false"
+watch_termination_pid=""
+
+if [[ "$harness" == "claude" ]]; then
+  # Capability gate: verify every required claude subcommand is available.
+  # Resolved through $AGENT (the harness path this worker was invoked with),
+  # not a hardcoded literal `claude`, so a fake-CLI test can substitute its own
+  # binary the same way every other harness-launch test in this tree already
+  # does.  The bypass-permissions disclaimer is documented as a required
+  # one-time per-machine/account setup step (PRD CH-7): run
+  # `claude --dangerously-skip-permissions` interactively once per machine/
+  # account before dispatching a Claude worker; it cannot be checked here
+  # because its exact refusal text and exit code were not independently
+  # measured on a fresh machine.
+  command -v "$AGENT" >/dev/null 2>&1 || {
+    printf 'failed: claude command not found\n' > "$REPO_STATE/status"
+    printf 'failed: claude command not found\n' > "$WORKTREE/.sergeant-status"
+    echo "ERROR: claude command not found; install Claude Code ≥ 2.1.220" >&2
+    exit 2
+  }
+  # jq is required, not optional: the post-launch liveness check, the
+  # unexpected-death detector, and the transcript substitution-warning scan
+  # all parse `claude agents --json` through it.  Failing closed here matches
+  # this codebase's own established convention (sgt-cleanup dies the same way
+  # when td/jq are missing) rather than letting those three checks silently
+  # no-op for want of a JSON parser.
+  command -v jq >/dev/null 2>&1 || {
+    printf 'failed: jq is required for the claude harness\n' > "$REPO_STATE/status"
+    printf 'failed: jq is required for the claude harness\n' > "$WORKTREE/.sergeant-status"
+    echo "ERROR: jq is required for the claude harness (model verification and unexpected-death detection depend on it)" >&2
+    exit 2
+  }
+  _sgt_claude_help="$("$AGENT" --help 2>&1 || true)"
+  for _sgt_cap in --bg attach stop agents respawn; do
+    printf '%s\n' "$_sgt_claude_help" | grep -qF -- "$_sgt_cap" || {
+      printf 'failed: claude missing required capability: %s\n' "$_sgt_cap" \
+        > "$REPO_STATE/status"
+      printf 'failed: claude missing required capability: %s\n' "$_sgt_cap" \
+        > "$WORKTREE/.sergeant-status"
+      echo "ERROR: claude missing required capability '$_sgt_cap'; install Claude Code ≥ 2.1.220" >&2
+      exit 2
+    }
+  done
+  unset _sgt_claude_help _sgt_cap
+
+  # Pre-flight model regex: reject any model value that is not a bare alias
+  # or a full claude-<family>-<version> ID before spending a real API call.
+  # The provider segment was already stripped by _sgt_resolve_agent_launch
+  # (argv-bare transport, provider_scope=anthropic), so the value reaching this
+  # check is the model ID only.  The regex is still load-bearing as defence-in-
+  # depth against a bypass of the normal tuple-parsing path.
+  _SGT_CLAUDE_MODEL_RE='^(sonnet|opus|haiku|fable|claude-[a-z][a-z0-9]*-[0-9][A-Za-z0-9._-]*)$'
+  if [[ "${#SGT_LAUNCH_MODEL_ARGV[@]}" -ge 2 ]]; then
+    # Bash 3.2 has no negative array subscript ([-1]); compute the last index
+    # explicitly, matching the version floor _sgt-bash-version.sh enforces.
+    _sgt_last_idx=$(( ${#SGT_LAUNCH_MODEL_ARGV[@]} - 1 ))
+    _sgt_model_val="${SGT_LAUNCH_MODEL_ARGV[$_sgt_last_idx]}"
+    unset _sgt_last_idx
+    if [[ ! "$_sgt_model_val" =~ $_SGT_CLAUDE_MODEL_RE ]]; then
+      printf 'failed: claude model pin rejected by pre-flight check: %s\n' \
+        "$_sgt_model_val" > "$REPO_STATE/diagnostic"
+      printf 'failed: claude model pin rejected: %s\n' "$_sgt_model_val" \
+        > "$REPO_STATE/status"
+      printf 'failed: claude model pin rejected: %s\n' "$_sgt_model_val" \
+        > "$WORKTREE/.sergeant-status"
+      echo "ERROR: claude model pin rejected by pre-flight check: $_sgt_model_val" >&2
+      exit 2
+    fi
+    unset _sgt_model_val
+  fi
+
+  # Read the initial instruction for the --bg launch prompt.  The notification
+  # is published to fleet state before sgt-dispatch starts the worker pane, so
+  # it is always available here.
+  _sgt_init_notif_id="$(cat "$REPO_STATE/notification_id" 2>/dev/null || true)"
+  _sgt_init_instruction="Read the .sergeant-brief.md file and execute the mission."
+  if [[ -n "$_sgt_init_notif_id" ]]; then
+    _sgt_notif_file="$REPO_STATE/notifications/$_sgt_init_notif_id/notification"
+    if [[ -f "$_sgt_notif_file" ]]; then
+      _sgt_read_instr="$(sed -n 's/^instruction=//p' "$_sgt_notif_file" 2>/dev/null || true)"
+      [[ -n "$_sgt_read_instr" ]] && _sgt_init_instruction="$_sgt_read_instr"
+    fi
+  fi
+  unset _sgt_init_notif_id _sgt_notif_file _sgt_read_instr
+
+  # Session name: task ID + repo for human-readable identification in `claude agents`.
+  _sgt_claude_task_id="$(basename "$(dirname "$REPO_STATE")" 2>/dev/null || true)"
+  _sgt_claude_repo="$(basename "$REPO_STATE" 2>/dev/null || true)"
+  _sgt_claude_session_name="sgt-${_sgt_claude_task_id:-worker}-${_sgt_claude_repo:-repo}"
+  unset _sgt_claude_task_id _sgt_claude_repo
+
+  # Launch the background session.  The model argv is consumed here, not at
+  # the final attach call; SGT_LAUNCH_MODEL_ARGV is cleared afterward so the
+  # generic assembly block below appends nothing.
+  _sgt_bg_output=""
+  if [[ "${#SGT_LAUNCH_MODEL_ARGV[@]}" -gt 0 ]]; then
+    _sgt_bg_output="$("$AGENT" --bg --name "$_sgt_claude_session_name" \
+      "${SGT_LAUNCH_MODEL_ARGV[@]}" "$_sgt_init_instruction" 2>/dev/null)" || {
+      printf 'failed: claude --bg launch failed\n' > "$REPO_STATE/status"
+      printf 'failed: claude --bg launch failed\n' > "$WORKTREE/.sergeant-status"
+      echo "ERROR: claude --bg launch failed" >&2
+      exit 2
+    }
+  else
+    _sgt_bg_output="$("$AGENT" --bg --name "$_sgt_claude_session_name" \
+      "$_sgt_init_instruction" 2>/dev/null)" || {
+      printf 'failed: claude --bg launch failed\n' > "$REPO_STATE/status"
+      printf 'failed: claude --bg launch failed\n' > "$WORKTREE/.sergeant-status"
+      echo "ERROR: claude --bg launch failed" >&2
+      exit 2
+    }
+  fi
+  unset _sgt_claude_session_name _sgt_init_instruction
+
+  # Extract the background ID from stdout.  claude --bg prints the short ID.
+  _SGT_CLAUDE_BG_ID="$(printf '%s' "$_sgt_bg_output" | tr -d '[:space:]')"
+  unset _sgt_bg_output
+
+  if [[ -z "$_SGT_CLAUDE_BG_ID" ]]; then
+    printf 'failed: claude --bg returned no background ID\n' > "$REPO_STATE/status"
+    printf 'failed: claude --bg returned no background ID\n' > "$WORKTREE/.sergeant-status"
+    echo "ERROR: claude --bg returned no background ID" >&2
+    exit 2
+  fi
+
+  # Fail closed on a malformed background ID here, at capture time, rather
+  # than relying on _sgt_claude_bg_id_and_bin's read-side charset check to
+  # coincidentally match whatever the CLI happened to emit.  Every one of the
+  # nine termination-path backstops resolves the id through that same regex
+  # (bin/_sgt-drain.sh), so an id outside this shape would otherwise get
+  # persisted and later silently defeat every one of those backstops.
+  if [[ ! "$_SGT_CLAUDE_BG_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'failed: claude --bg returned malformed background ID: %s\n' \
+      "$_SGT_CLAUDE_BG_ID" > "$REPO_STATE/status"
+    printf 'failed: claude --bg returned malformed background ID: %s\n' \
+      "$_SGT_CLAUDE_BG_ID" > "$WORKTREE/.sergeant-status"
+    echo "ERROR: claude --bg returned malformed background ID: $_SGT_CLAUDE_BG_ID" >&2
+    exit 2
+  fi
+
+  # Persist the background ID immediately, before the liveness check loop
+  # below (which can take several real seconds against a genuine API call,
+  # not just its bounded worst case) — not after it.  A worker process death
+  # during that window would otherwise leave a genuinely live background
+  # session with no recorded identity anywhere, so none of the nine
+  # termination-path backstops could ever find and stop it.  claude_session_id
+  # is not yet known at this point; the second _record_worker_identity call
+  # after the liveness loop adds it once the liveness check has parsed it.
+  _record_worker_identity
+
+  # Bounded post-launch liveness check: poll claude agents --json for the new
+  # session; if state reaches 'failed' within the bounded window, the launch failed.
+  # Also capture the sessionId for identity persistence.
+  _sgt_liveness_attempts="${SGT_CLAUDE_LIVENESS_ATTEMPTS:-10}"
+  _sgt_liveness_interval="${SGT_CLAUDE_LIVENESS_INTERVAL:-1}"
+  _sgt_claude_state=""
+  _sgt_liveness_attempt=0
+  while (( _sgt_liveness_attempt < _sgt_liveness_attempts )); do
+    sleep "$_sgt_liveness_interval"
+    _sgt_agents_json="$("$AGENT" agents --json 2>/dev/null || true)"
+    if [[ -n "$_sgt_agents_json" ]] && command -v jq >/dev/null 2>&1; then
+      _sgt_entry="$(printf '%s\n' "$_sgt_agents_json" | \
+        jq -c ".[] | select(.id == \"$_SGT_CLAUDE_BG_ID\")" 2>/dev/null || true)"
+      if [[ -n "$_sgt_entry" ]]; then
+        _sgt_claude_state="$(printf '%s\n' "$_sgt_entry" | \
+          jq -r '.state // ""' 2>/dev/null || true)"
+        _SGT_CLAUDE_SESSION_ID="$(printf '%s\n' "$_sgt_entry" | \
+          jq -r '.sessionId // ""' 2>/dev/null || true)"
+        if [[ "$_sgt_claude_state" == "failed" ]]; then
+          printf 'failed: claude background session failed after launch: id=%s\n' \
+            "$_SGT_CLAUDE_BG_ID" > "$REPO_STATE/status"
+          printf 'failed: claude background session failed after launch: id=%s\n' \
+            "$_SGT_CLAUDE_BG_ID" > "$WORKTREE/.sergeant-status"
+          echo "ERROR: claude background session failed post-launch: $_SGT_CLAUDE_BG_ID" >&2
+          exit 2
+        fi
+        [[ "$_sgt_claude_state" != "" ]] && break
+      fi
+    fi
+    _sgt_liveness_attempt=$(( _sgt_liveness_attempt + 1 ))
+  done
+  unset _sgt_liveness_attempts _sgt_liveness_interval _sgt_liveness_attempt
+  unset _sgt_agents_json _sgt_entry _sgt_claude_state
+
+  # Re-persist now that claude_session_id is known too (the background id was
+  # already persisted before the liveness loop above; this call is what adds
+  # the session id, and re-writing the same background id here is a no-op).
+  _record_worker_identity
+
+  # No pane-clear step is needed here.  Every command in this pre-launch block
+  # (--bg, agents --json) runs as a command substitution, so its output is
+  # captured into a shell variable and never reaches the pane's terminal at
+  # all — there is no "--bg confirmation text" sitting in the pane for the
+  # readiness probe to mistake for `attach`'s own rendering.  (An earlier
+  # version of this block sent literal "clear" keystrokes via tmux send-keys
+  # to guard against that race; that was actively wrong, since nothing is
+  # reading the pane's stdin while this block runs — the keystrokes would
+  # either echo visibly, which is the exact race this was meant to prevent, or
+  # queue unread and be delivered as spurious first input to the real `claude
+  # attach` session once it starts reading stdin.)  The pane genuinely stays
+  # blank until `attach` below paints its own first frame, which is the same
+  # starting condition OpenCode/Goose already have.
+
+  # Repoint the base argv to attach; clear model argv so the generic assembly
+  # below appends nothing.  Record whether a model was pinned BEFORE clearing,
+  # since the transcript substitution-warning scan (after the main invocation)
+  # needs to know whether to run and SGT_LAUNCH_MODEL_ARGV is empty by then.
+  if [[ "${#SGT_LAUNCH_MODEL_ARGV[@]}" -ge 2 ]]; then
+    _SGT_CLAUDE_MODEL_PINNED="true"
+  else
+    _SGT_CLAUDE_MODEL_PINNED="false"
+  fi
+  SGT_LAUNCH_BASE_ARGV=(attach "$_SGT_CLAUDE_BG_ID")
+  SGT_LAUNCH_MODEL_ARGV=()
+
+  # Write intended launch record now (with background ID included) since it
+  # could not be written before --bg returned the ID.
+  rm -f "$REPO_STATE/launch_record"
+  if ! _write_launch_record intended; then
+    printf 'launch evidence unwritable at %s/launch_record\n' "$REPO_STATE" \
+      > "$REPO_STATE/diagnostic"
+    printf 'failed: cannot record launch evidence\n' > "$REPO_STATE/status"
+    printf 'failed: cannot record launch evidence\n' > "$WORKTREE/.sergeant-status"
+    echo "ERROR: cannot record launch evidence; refusing to launch unprovable worker" >&2
+    exit 2
+  fi
+fi
+# ── End Claude pre-launch block ──────────────────────────────────────────────
+
 _deliver_notifications &
 notification_pid=$!
 _watch_progress &
@@ -641,10 +973,21 @@ watch_progress_pid=$!
 _watch_drain &
 watch_drain_pid=$!
 
+# Start the Claude termination watcher only for Claude background sessions.
+# It polls durable state and stops the background session on terminal completion,
+# which causes the blocked `claude attach` call to exit and fires _finish.
+if [[ "$harness" == "claude" && -n "$_SGT_CLAUDE_BG_ID" ]]; then
+  _watch_termination "$_SGT_CLAUDE_BG_ID" &
+  watch_termination_pid=$!
+fi
+
 # Build launch argv from the resolved harness contract.  SGT_LAUNCH_BASE_ARGV
 # was populated by _sgt_resolve_agent_launch from the same registry that gated
 # acceptance and supplies the readiness probe, so base args, model pin, and
-# readiness cannot diverge.
+# readiness cannot diverge.  For the Claude harness, SGT_LAUNCH_BASE_ARGV was
+# overwritten above with (attach "$_SGT_CLAUDE_BG_ID") and SGT_LAUNCH_MODEL_ARGV
+# was cleared, so the assembly below produces `claude attach <id>` with nothing
+# appended.
 set --
 if [[ "${#SGT_LAUNCH_BASE_ARGV[@]}" -gt 0 ]]; then
   set -- "${SGT_LAUNCH_BASE_ARGV[@]}"
@@ -662,13 +1005,132 @@ if [[ "${#SGT_LAUNCH_MODEL_ENV[@]}" -gt 0 ]]; then
     export "$_launch_pair"
   done
 fi
-rm -f "$REPO_STATE/launch_record"
-if ! _write_launch_record intended; then
-  printf 'launch evidence unwritable at %s/launch_record\n' "$REPO_STATE" \
-    > "$REPO_STATE/diagnostic"
-  printf 'failed: cannot record launch evidence\n' > "$REPO_STATE/status"
-  printf 'failed: cannot record launch evidence\n' > "$WORKTREE/.sergeant-status"
-  echo "ERROR: cannot record launch evidence; refusing to launch unprovable worker" >&2
-  exit 2
+# For non-Claude harnesses, write the intended launch record here (the pre-launch
+# block above already wrote it for Claude).
+if [[ "$harness" != "claude" ]]; then
+  rm -f "$REPO_STATE/launch_record"
+  if ! _write_launch_record intended; then
+    printf 'launch evidence unwritable at %s/launch_record\n' "$REPO_STATE" \
+      > "$REPO_STATE/diagnostic"
+    printf 'failed: cannot record launch evidence\n' > "$REPO_STATE/status"
+    printf 'failed: cannot record launch evidence\n' > "$WORKTREE/.sergeant-status"
+    echo "ERROR: cannot record launch evidence; refusing to launch unprovable worker" >&2
+    exit 2
+  fi
 fi
-"$AGENT" "$@"
+
+# ── Main harness invocation ──────────────────────────────────────────────────
+# For Claude: this is `claude attach <id>`, which blocks until the termination
+# watcher runs `claude stop <id>` (normal completion) or until an unexpected
+# runtime death causes attach to exit.  Unexpected death recovery: if attach
+# exits with a non-terminal durable state and the background session is stopped,
+# respawn and re-attach to restore the session without re-delivering the prompt.
+if [[ "$harness" == "claude" && -n "$_SGT_CLAUDE_BG_ID" ]]; then
+  # Clears the pane's stale rendering and resets readiness bookkeeping before
+  # a re-attach.  Shared by both re-attach paths in the loop below (a
+  # confirmed death needing respawn first, and a session still genuinely
+  # alive needing no respawn at all); only whether respawn runs first differs.
+  _sgt_reattach() {
+    # The dead attach's own rendering is still sitting in the pane's virtual
+    # terminal buffer — nothing clears it automatically once the process that
+    # painted it exits.  Print the clear-screen escape sequence directly to
+    # our own stdout (still the pane's pty at this point, since the harness
+    # call above was a plain subshell call, not exec) rather than via
+    # `tmux send-keys`: send-keys delivers INPUT, which nothing is reading
+    # right now, so it would either sit unread and be delivered as spurious
+    # first input to the next `attach` session, or echo visibly — the exact
+    # race this step exists to close.
+    printf '\033[2J\033[H'
+    # Reset the shared readiness bookkeeping so the two-consecutive-
+    # observation rule restarts against this freshly blank pane instead of
+    # reporting ready off the stale content the reset just erased.  These
+    # variables are the same ones _sgt_harness_ready_tui (bin/_sgt-harness.sh)
+    # tracks across this whole worker process's lifetime.
+    _SGT_HARNESS_READY_PANE=""
+    _SGT_HARNESS_READY_SINCE=""
+  }
+  while true; do
+    "$AGENT" "$@"
+    _sgt_attach_exit=$?
+    _sgt_attach_status="$(_status)"
+    # Respawn/reattach is only ever considered while .sergeant-status is still
+    # the unchanged "in_progress" it started at: any OTHER value — done,
+    # failed:*, drained, orphaned, or a cooperative nonterminal gate the agent
+    # itself published (needs_input, blocked, waiting) — means the agent or an
+    # existing mechanism already decided how this turn ends, and attach
+    # exiting afterward is the expected, not the unexpected, case.  Matching a
+    # fixed list of "terminal-looking" values here previously missed
+    # needs_input/blocked/waiting, which made a legitimate cooperative gate
+    # look like an unexpected death and triggered a spurious re-attach.
+    if [[ "$_sgt_attach_status" != "in_progress" ]]; then
+      break
+    fi
+    # Non-terminal exit from attach: check whether the background session
+    # actually died (stopped) or is still genuinely running.  attach can exit
+    # for reasons that never touch the underlying session at all — the
+    # research spike measured that detaching (arrow key, Ctrl+Z, /exit, double
+    # Ctrl+C/Ctrl+D) never stops it — so a session still reported working or
+    # blocked must be re-attached directly, never treated as done.  Falling
+    # through to _finish here would let _finish's own unconditional backstop
+    # stop a session that never actually finished the mission.
+    _sgt_session_state=""
+    if command -v jq >/dev/null 2>&1; then
+      _sgt_session_state="$("$AGENT" agents --json 2>/dev/null | \
+        jq -r ".[] | select(.id == \"$_SGT_CLAUDE_BG_ID\") | .state" 2>/dev/null || true)"
+    fi
+    case "$_sgt_session_state" in
+      stopped)
+        # Unexpected death: respawn to restore the session (same sessionId,
+        # conversation intact), then clear the pane and re-attach.
+        if "$AGENT" respawn "$_SGT_CLAUDE_BG_ID" 2>/dev/null; then
+          _sgt_reattach
+          continue
+        fi
+        ;;
+      working|blocked)
+        # The session never died; only the attach connection did.  Re-attach
+        # directly — no respawn needed, since nothing needs restoring.
+        _sgt_reattach
+        continue
+        ;;
+    esac
+    unset _sgt_session_state
+    # Could not respawn, or the state is neither a confirmed death nor a
+    # confirmed live session (e.g. the query itself failed): fall through to
+    # _finish rather than looping on an assumption that cannot be verified.
+    break
+  done
+  unset -f _sgt_reattach
+  unset _sgt_attach_exit _sgt_attach_status _sgt_session_state
+else
+  "$AGENT" "$@"
+fi
+
+# ── Transcript substitution-warning scan ────────────────────────────────────
+# Neither the pre-flight regex nor the post-launch liveness check catches a
+# valid model alias the account is not entitled to: Claude silently substitutes
+# another model and completes the mission successfully, with no failed state and
+# no non-zero exit code.  The only signal is a transcript line:
+#   Model "<X>" is restricted by your organization's settings. Using <Y> instead.
+# A pinned model is "honored" only when this scan confirms the line's absence.
+# This check runs after the attach exits to avoid blocking the mission itself;
+# it records a diagnostic but does not change the mission's terminal status.
+if [[ "$harness" == "claude" && -n "$_SGT_CLAUDE_BG_ID" && \
+      "$_SGT_CLAUDE_MODEL_PINNED" == "true" ]] && \
+   command -v "$AGENT" >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+  _sgt_transcript="$("$AGENT" agents --json 2>/dev/null | \
+    jq -r ".[] | select(.id == \"$_SGT_CLAUDE_BG_ID\") | .transcript // \"\"" \
+    2>/dev/null || true)"
+  if printf '%s' "$_sgt_transcript" | \
+      grep -qiF 'is restricted by your organization' 2>/dev/null; then
+    _sgt_subst_warning="model substitution warning detected in Claude transcript for $_SGT_CLAUDE_BG_ID: pinned model may not have been honored"
+    # A dedicated file, not $REPO_STATE/diagnostic: _finish unconditionally
+    # clears the shared diagnostic file on every non-orphaned exit (including
+    # the success path this scan runs on), so writing there would erase the
+    # warning before anything could read it.  This finding must survive a
+    # successful mission's own cleanup.
+    printf '%s\n' "$_sgt_subst_warning" >> "$REPO_STATE/model_substitution_warning"
+    printf 'WARNING: %s\n' "$_sgt_subst_warning" >&2
+  fi
+  unset _sgt_transcript _sgt_subst_warning
+fi

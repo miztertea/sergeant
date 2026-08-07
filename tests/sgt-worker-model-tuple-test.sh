@@ -344,9 +344,15 @@ fi
 # ── 7. A tuple the harness cannot honor fails closed before the harness runs ──
 # The coordinator validates at dispatch time, but a hand-edited or replayed
 # fleet record must not silently drop the pin and inherit the ambient default.
+#
+# Claude moved off the "unmeasured" model transport to "argv-bare" (Claude
+# Background Harness PRD, CH-3) — its own launch/verification behavior is
+# covered by tests/sgt-claude-worker-test.sh, not here.  A provider outside
+# Claude's fixed anthropic scope still fails closed through this same
+# generic contract path, so that coverage moves here instead.
 
-_reject_launch reject-unmeasured claude anthropic/claude-opus-5 \
-  'Sergeant has not measured claude launch-time model pinning'
+_reject_launch reject-out-of-scope-provider claude openai/gpt-5.2 \
+  'claude can only be pinned to provider anthropic'
 _reject_launch reject-malformed opencode 'claude-opus-5' \
   'model must be provider/model'
 

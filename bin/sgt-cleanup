@@ -188,6 +188,13 @@ _stop_local_worker() {
   local worktree="$2"
   local pane pane_info pane_dead pane_pid pane_pgid tree_records tree_pids live_tree_pids cwd_pids
 
+  # Claude-specific backstop: stop the background session before killing the
+  # pane so the Claude supervisor process does not continue running after the
+  # pane and its process group are gone.  Idempotent — safe to call even if
+  # the termination watcher already stopped it.  A background Claude session is
+  # invisible to process-tree/process-group signalling and to tmux kill-pane.
+  _sgt_claude_stop_bg_session "$repo_dir"
+
   pane="$(cat "$repo_dir/pane" 2>/dev/null || true)"
   tree_records=""
   tree_pids=""
@@ -301,6 +308,9 @@ _stop_validation_pane() {
   local tree_records tree_pids live_tree_pids recorded_pid recorded_pgid recorded_start actual_start
   pane="$(cat "$repo_dir/validation_pane" 2>/dev/null || true)"
   [[ -n "$pane" ]] || return 0
+  # Claude-specific backstop: stop the background session associated with the
+  # validation pane's worker before killing the pane.  Idempotent.
+  _sgt_claude_stop_bg_session "$repo_dir"
   recorded_pid="$(cat "$repo_dir/validation_pane_pid" 2>/dev/null || true)"
   recorded_pgid="$(cat "$repo_dir/validation_process_group" 2>/dev/null || true)"
   recorded_start="$(cat "$repo_dir/validation_process_start" 2>/dev/null || true)"

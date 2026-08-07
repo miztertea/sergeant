@@ -4443,14 +4443,50 @@ chmod 600 "$roi_state/pane_identity"
 printf 'sgt\n' > "$roi_state/tmux_session"
 printf 'roi-task/app\n' > "$roi_state/window_name"
 
+# Recorded validation pane — already gone (display-message fails for it), and
+# its recorded owner PID is not actually alive, so _stop_recorded_validation_group
+# takes its "nothing left to terminate" early return.
+printf '%%roi98\n' > "$roi_state/validation_pane"
+printf '999999\n' > "$roi_state/validation_pane_pid"
+printf '999999\n' > "$roi_state/validation_process_group"
+printf 'Mon Jan  1 00:00:00 2024\n' > "$roi_state/validation_process_start"
+
+# Both sgt-cleanup call sites for the shared Claude session backstop
+# (_stop_local_worker and _stop_validation_pane) share this repo_dir, so one
+# recorded background id proves both actually invoke
+# _sgt_claude_stop_bg_session, rather than merely still mentioning it in
+# source text.
+printf 'roi-claude-bg-1\n' > "$roi_state/claude_background_id"
+roi_claude_stop_log="$TEST_ROOT/roi-claude-stop-calls.log"
+cat > "$TEST_ROOT/fake-bin/claude" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "stop" ]]; then
+  printf '%s\n' "\$2" >> "$roi_claude_stop_log"
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$TEST_ROOT/fake-bin/claude"
+
 roi_tmux_log="$TEST_ROOT/roi-tmux.log"
 cat > "$TEST_ROOT/fake-bin/tmux-roi" << 'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$ROI_TMUX_LOG"
 case "$1" in
   display-message)
-    # Pane is dead (remain-on-exit): pane_dead=1
-    printf '1|%roi99|9999|2025-01-01T00:00:00|remain-on-exit-cmd\n'
+    target=""
+    previous=""
+    for arg in "$@"; do
+      [[ "$previous" == -t ]] && target="$arg"
+      previous="$arg"
+    done
+    if [[ "$target" == "%roi99" ]]; then
+      # Pane is dead (remain-on-exit): pane_dead=1
+      printf '1|%roi99|9999|2025-01-01T00:00:00|remain-on-exit-cmd\n'
+    else
+      # The validation pane (%roi98) is gone entirely.
+      exit 1
+    fi
     ;;
   kill-pane|new-window|send-keys|rename-window) exit 0 ;;
   has-session) exit 0 ;;
@@ -4482,6 +4518,10 @@ grep -qF 'kill-pane' "$roi_tmux_log" || {
 }
 grep -qF '%roi99' "$roi_tmux_log" || {
   printf 'FAIL issue#21: kill-pane was not called on the correct dead pane %%roi99\n' >&2
+  exit 1
+}
+grep -qF 'roi-claude-bg-1' "$roi_claude_stop_log" || {
+  printf 'FAIL: sgt-cleanup did not call claude stop for the recorded background id\n' >&2
   exit 1
 }
 printf 'sgt-cleanup remain-on-exit dead pane killed: ok\n'

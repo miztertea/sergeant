@@ -725,6 +725,11 @@ _rollback_validation_launch() {
     current_identity="$(_validation_current_pane_identity "$VALIDATION_PANE" || true)"
     if [[ "$current_identity" == "$VALIDATION_IDENTITY" || \
       "$current_identity" == "1|${VALIDATION_IDENTITY#*|}" ]]; then
+      # Claude-specific backstop: if no-mistakes's own review axes invoked Claude
+      # in background mode during this validation launch, stop that session
+      # before the validation pane is killed.  Idempotent; a no-op when no
+      # Claude background id was ever recorded for this validation run.
+      _sgt_claude_stop_bg_session "$REPO_STATE"
       if ! tmux kill-pane -t "$VALIDATION_PANE" 2>/dev/null; then
         printf 'ERROR: rollback could not stop owned validation pane: %s\n' \
           "$VALIDATION_PANE" >&2
