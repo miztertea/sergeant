@@ -66,13 +66,27 @@ rather than introducing a parallel one for a single harness.
 1. `sgt-dispatch --agent claude` produces a worker that exits on its own once Sergeant's durable
    state reaches a terminal value — no manual process termination required.
 2. Existing `_deliver_notifications`, `_watch_progress`, `_watch_drain`'s own polling logic,
-   `_finish`, pane-identity, and ACK/accept/complete logic require zero Claude-specific branching.
-   Named exceptions, none of which touch the steady-state delivery/notification loops themselves: the
-   launch-assembly step (Claude Harness Lifecycle — a value known only after a preceding command
-   returns); a `claude stop` backstop at each of the eight independent termination paths an
-   exhaustive sweep found (Recovery Semantics); and the prior-session-liveness check added to
-   `sgt-recover`/`sgt-respond`'s relaunch flow (Recovery Semantics). All are enumerated, not implied
-   away by a general "no branching" claim.
+   `_finish`, pane-identity, and ACK/accept/complete logic require zero Claude-specific branching
+   beyond five named exceptions, none of which touch the steady-state delivery/notification loops
+   themselves:
+   1. The launch-assembly step (Claude Harness Lifecycle — a value known only after a preceding
+      command returns).
+   2. The three-layer pinned-model verification logic (Claude Harness Lifecycle; CH-3) — syntactic,
+      liveness, and transcript-substitution checks that must run before and immediately after launch.
+   3. The unexpected-death respawn+reattach recovery loop (Claude Harness Lifecycle) — restoring the
+      worker's foreground slot after a runtime crash Sergeant's own durable state did not record as
+      terminal.
+   4. A `claude stop` backstop at each of the nine independent termination paths an exhaustive sweep
+      found — eight external call sites plus `_finish`'s own in-process backstop, since `_finish`
+      runs as the terminal step of every exit path, including a clean `done` exit none of the eight
+      external scripts ever observe (Recovery Semantics).
+   5. The prior-session-liveness check added to `sgt-recover`/`sgt-respond`'s relaunch flow (Recovery
+      Semantics).
+
+   All five are enumerated, not implied away by a general "no branching" claim; this list closing at
+   five rather than three was itself a documentation gap in an earlier draft of this PRD, found and
+   corrected during implementation — the underlying behavior (CH-1, CH-3, CH-8) was never in
+   question.
 3. A pinned `--model` works for Claude through the existing harness launch contract, and a launch
    whose pinned model was silently substituted is distinguishable from one that was honored.
 4. OpenCode and Goose dispatch, delivery, recovery, and cleanup behavior is unchanged.
@@ -171,9 +185,9 @@ launch-assembly block below them:
 - **Steady state.** The existing `tui` readiness probe, `_deliver_notifications`, `_watch_progress`,
   and pane-identity checks operate against the attached pane exactly as they already operate against
   a foreground OpenCode/Goose session. No Claude-specific delivery code is added here — of this PRD's
-  named exceptions (Outcome 2), only launch assembly is above; the eight-path termination backstop and
-  the relaunch prior-session check are teardown/recovery-path concerns covered separately in Recovery
-  Semantics.
+  five named exceptions (Outcome 2), launch assembly, model verification, and unexpected-death
+  recovery are covered above in this section; the nine-path termination backstop and the relaunch
+  prior-session check are teardown/recovery-path concerns covered separately in Recovery Semantics.
 - **Termination.** A new watcher, added alongside the existing `_deliver_notifications &`/
   `_watch_progress &`/`_watch_drain &` background loops, polls Sergeant's own durable state. On
   reaching terminal durable state, it runs `claude stop <background-id>`. This causes the attached
@@ -188,7 +202,7 @@ launch-assembly block below them:
 ## Recovery Semantics
 
 - **Every path that can end a worker's pane or process must also stop its recorded Claude background
-  session — an exhaustive sweep of this codebase's termination logic found eight, not the two most
+  session — an exhaustive sweep of this codebase's termination logic found nine, not the two most
   obvious ones.** A background Claude session is not a child of the worker's process group and is
   invisible to process-tree/process-group signaling and to `tmux kill-pane` alike (Claude Harness
   Lifecycle; the spike's own description of the supervisor). Confirmed present in:
@@ -209,10 +223,14 @@ launch-assembly block below them:
   - `sgt-validate`'s validation-launch rollback — a secondary instance, if `no-mistakes`'s own review
     axes invoke Claude in background mode; lower confidence than the others but the same shape.
   - `sgt-interactive-worker`'s own `_drain_terminate` (cooperative drain).
+  - `sgt-interactive-worker`'s own `_finish` — the ninth site, found during implementation rather
+    than by the original sweep: it runs as the terminal step of every exit path, including a clean
+    `done` exit none of the eight external scripts above ever observe, so it needs its own backstop
+    independent of them, not merely a restatement of `_drain_terminate`'s cooperative-drain case.
 
   Each of these must call `claude stop <id>` for the recorded `claude_background_id`, idempotent (a
   repeat stop on an already-stopped id is a no-op success, not an error), before or alongside
-  whatever pane/process action it already takes. This list closing at eight rather than two or three
+  whatever pane/process action it already takes. This list closing at nine rather than two or three
   is itself the point: a fix scoped to only the instances a prior pass happened to name would leave
   the identical defect in whichever path was checked last.
 
@@ -225,11 +243,12 @@ launch-assembly block below them:
   `--bg` and holds the id as a live shell variable with zero file I/O needed in-process. Every one of
   the seven other consumers above already has the corresponding fleet-state directory in scope at the
   exact point it kills something today — extending each with one more best-effort read and a `claude
-  stop` call is mechanical, not new architecture. `_drain_terminate` is a partial exception worth
-  naming precisely: it runs in-process, forked from the worker itself, so it can use the inherited
-  shell variable directly and does not strictly need the persisted file for its own purposes — it
-  should still be persisted regardless, both to keep every consumer's read pattern uniform and
-  because the other seven paths are genuinely separate processes with no such inheritance available.
+  stop` call is mechanical, not new architecture. `_drain_terminate` and `_finish` are both partial
+  exceptions worth naming precisely: each runs in-process — `_drain_terminate` forked from the worker
+  itself, `_finish` as the worker's own EXIT-trap handler — so each can use the inherited shell
+  variable directly and does not strictly need the persisted file for its own purposes. Both should
+  still be persisted regardless, both to keep every consumer's read pattern uniform and because the
+  other seven paths are genuinely separate processes with no such inheritance available.
 
 - **A relaunch must check for, and stop, a still-live background session from a *prior* attempt
   before starting a new one against the same worktree — a distinct leak, not the same bug as
@@ -247,7 +266,7 @@ launch-assembly block below them:
 - `claude stop`/`kill` are documented as literal aliases with no described graceful-shutdown window.
   Measured against a real mid-task bash loop, an external stop left no corrupted output and no
   orphaned child processes, but this is evidence the common case is safe, not a guaranteed atomicity
-  property — the eight-path backstop above exists precisely because no single termination watcher
+  property — the nine-path backstop above exists precisely because no single termination watcher
   firing first can be assumed.
 - The termination watcher must not treat `.sergeant-status=done` alone as sufficient to stop the
   runtime; it must also require `.sergeant-result` to be non-empty, matching `_finish`'s own existing
@@ -312,9 +331,10 @@ launch-assembly block below them:
    no manual intervention, and `_finish` runs its genuine-completion branch.
 2. **CH-2:** `_deliver_notifications`, `_watch_progress`, `_watch_drain`'s polling logic, and the
    pane-identity checks in `sgt-interactive-worker` contain no `if [[ "$harness" == "claude" ]]`-style
-   branch. The launch-assembly step, the eight-path termination backstop, and the relaunch
-   prior-session check (all in Claude Harness Lifecycle / Recovery Semantics) are named exceptions,
-   not violations of this criterion — see Outcome 2.
+   branch. The launch-assembly step, the three-layer model-verification logic, the unexpected-death
+   respawn+reattach loop, the nine-path termination backstop, and the relaunch prior-session check
+   (all in Claude Harness Lifecycle / Recovery Semantics) are the five named exceptions, not
+   violations of this criterion — see Outcome 2.
 3. **CH-3:** A pinned `--model` is verified in the three layers Claude Harness Lifecycle specifies:
    an out-of-shape value (e.g., any `provider/model` qualified form) is rejected before `claude --bg`
    is called; a shaped-but-invalid value is caught by the post-launch liveness check within its
@@ -325,11 +345,12 @@ launch-assembly block below them:
 4. **CH-4:** A fake-CLI test suite covers: identity persistence across `respawn`; unknown
    `agents --json` fields ignored; unknown state values fail closed; `stop`-causes-`attach`-to-exit
    with exit code `0`; a message queued while the session is busy is delivered after the current
-   turn; and, for each of the eight independent termination paths named in Recovery Semantics
+   turn; and, for each of the nine independent termination paths named in Recovery Semantics
    individually (`sgt-cleanup` ×2, `sgt-watch`, `sgt-drain-force`, `sgt-recover` stall-kill,
    `sgt-respond` supersede-kill, `sgt-dispatch` rollback, `sgt-validate` rollback,
-   `sgt-interactive-worker`'s own `_drain_terminate`), that its `claude stop` backstop is idempotent
-   whether or not the termination watcher already stopped the session first.
+   `sgt-interactive-worker`'s own `_drain_terminate`, and `sgt-interactive-worker`'s own `_finish`),
+   that its `claude stop` backstop is idempotent whether or not the termination watcher already
+   stopped the session first.
 5. **CH-5:** A real-Claude contract test reproduces the original defect end to end — mission written,
    `.sergeant-status=done` set after `.sergeant-result`, worker exits unattended, no live `claude`
    process or monitoring loop remains — and is re-run against every future Claude Code version bump
